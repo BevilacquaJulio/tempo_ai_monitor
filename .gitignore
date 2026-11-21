@@ -1,0 +1,80 @@
+# =============================================================================
+# TempoAI — .gitignore
+# React + Vite + TypeScript · Tauri 2 + Rust · SQLite · Playwright · Windows
+# =============================================================================
+
+# --- Segredos e credenciais --------------------------------------------------
+# `.env.*` não casa com `.env`; as duas linhas são necessárias.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# --- Guias e notas locais privadas -------------------------------------------
+/readme-ignored.md
+/README-ignored.md
+
+# --- Dados locais de runtime (SQLite e preferências) -------------------------
+# Migrações em `src-tauri/migrations/*.sql` continuam versionadas.
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+preferences.json
+preferences.json.bak*
+
+# --- Dependências ------------------------------------------------------------
+node_modules/
+
+# --- Build e cache do frontend -----------------------------------------------
+/dist/
+build/
+*.tsbuildinfo
+.vite/
+.cache/
+*.local
+
+# --- Rust, Tauri, toolchain local e executáveis de release -------------------
+# `.toolchain/` guarda Rust/Windows SDK locais desta máquina; nunca publicar.
+/src-tauri/target/
+/src-tauri/gen/
+src-tauri/.tmp*
+/.toolchain/
+/release/
+
+# --- Testes e relatórios do navegador ----------------------------------------
+coverage/
+.vitest-cache/
+test-results/
+playwright-report/
+playwright/.auth/
+
+# --- Logs --------------------------------------------------------------------
+*.log
+logs/
+npm-debug.log*
+
+# --- Sistema operacional -----------------------------------------------------
+Desktop.ini
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+.DS_Store
+._*
+*~
+
+# --- Editores ----------------------------------------------------------------
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*.bak
+*.orig

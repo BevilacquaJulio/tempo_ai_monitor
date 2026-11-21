@@ -1,0 +1,33 @@
+[package]
+name = "tempo-ai"
+version = "0.1.0"
+description = "All your AI. One place."
+authors = ["Julio Bevilacqua"]
+license = "MIT"
+repository = "https://github.com/BevilacquaJulio/tempo_ai_monitor"
+edition = "2021"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+tempfile = "3"
+base64 = "0.23"
+# Already pulled in by Tauri; native-tls uses the Windows TLS stack instead of bundling another one.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
