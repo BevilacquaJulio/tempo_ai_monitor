@@ -28,7 +28,9 @@ export function QuickMonitor() {
     onSuccess: () => preferences.refetch(),
   })
   const settings = preferences.data?.settings
-  const now = useClock(Boolean(data?.providers.some(({ quotas }) => quotas.some(({ resetAt }) => resetAt))), 30_000)
+  const hasActiveRetry = Boolean(data?.providers.some(({ waitingFor, nextRetryAt }) => waitingFor === 'retry' && Boolean(nextRetryAt)))
+  const hasReset = Boolean(data?.providers.some(({ quotas }) => quotas.some(({ resetAt }) => resetAt)))
+  const now = useClock(hasActiveRetry || hasReset, hasActiveRetry ? 1_000 : 30_000)
   const refetchPreferences = preferences.refetch
 
   useEffect(() => {
@@ -70,12 +72,12 @@ export function QuickMonitor() {
         const loading = isInitialLoading(provider)
         const body = `quick-${provider.providerId}`
         return <section className="quick-provider card-enter" style={{ animationDelay: `${Math.min(index, 5) * 35}ms` }} key={provider.providerId} aria-label={provider.displayName} data-collapsed={closed || undefined}>
-          <header><ProviderMark id={provider.providerId} /><h2>{provider.displayName}</h2><IntegrationIndicator status={provider.integration} saved={provider.connectionSaved} loading={loading} />
+          <header><ProviderMark id={provider.providerId} /><h2>{provider.displayName}</h2><IntegrationIndicator status={provider.integration} saved={provider.connectionSaved} loading={loading} checking={Boolean(provider.checking)} />
             <CollapseButton name={provider.displayName} expanded={!closed} controls={body} onToggle={() => collapsed.toggle(provider.providerId)} /></header>
           {closed ? <CollapsedSummary provider={provider} now={now} /> : <div id={body} className="body-reveal">
           {loading ? (
             <ProviderQuotaSkeleton compact />
-          ) : showSavedReading(provider) ? <StaleProviderUsage provider={provider} /> : provider.quotas.map((quota) => {
+          ) : showSavedReading(provider) ? <StaleProviderUsage provider={provider} now={now} /> : provider.quotas.map((quota) => {
             const reset = trustedReset(quota)
             const label = quotaLabel(quota, provider.providerId, t)
             const used = currentUsage(quota, now)

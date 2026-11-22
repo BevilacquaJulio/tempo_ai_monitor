@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod jsonl;
 
 use chrono::{DateTime, SecondsFormat};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub type Sessions = Vec<(i64, Value)>;
@@ -15,11 +16,12 @@ pub fn observation_is_stale(at: i64, now: i64) -> bool {
     now.saturating_sub(at) > OBSERVATION_MAX_AGE
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub plan: Option<String>,
     pub quotas: Vec<Value>,
     pub at: i64,
+    #[serde(default)]
     pub daily_tokens: Vec<Value>,
 }
 

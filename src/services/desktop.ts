@@ -21,7 +21,9 @@ export interface ProviderScan {
 }
 
 export type ProviderConnection =
-  | { kind: 'claudeAuto' | 'codexAuto' | 'antigravityAuto' }
+  | { kind: 'claudeAuto' }
+  | { kind: 'codexAuto'; executable?: string | null }
+  | { kind: 'antigravityAuto'; executable?: string | null }
   | { kind: 'local'; source: LocalProvider }
 
 export interface Preferences {
@@ -32,7 +34,9 @@ export interface Preferences {
   shortcut: string
   claudeEnabled: boolean
   codexEnabled: boolean
+  codexExecutable?: string | null
   antigravityEnabled: boolean
+  antigravityExecutable?: string | null
   notifications: boolean
   claudeAlerts: boolean
   codexAlerts: boolean
@@ -102,9 +106,21 @@ export interface IntegrationCheck {
   message: string
 }
 
+export interface UpdateCheck {
+  status: 'up_to_date' | 'update_available' | 'no_release'
+  currentVersion: string
+  latestVersion: string | null
+  publishedAt: string | null
+  notes: string | null
+  releaseUrl: string
+  installerUrl: string | null
+  portableUrl: string | null
+  runningPortable: boolean
+}
+
 export const desktop = isTauri()
 export const quickWindow = desktop && getCurrentWebviewWindow().label === 'quick'
-export const readDesktopUsage = () => invoke<UsageSnapshot>('usage_snapshot', { includeSessions: false })
+export const readDesktopUsage = () => invoke<UsageSnapshot>('usage_snapshot')
 export const readDesktopSessions = () => invoke<SessionHistory>('session_history')
 export const getPreferences = () => invoke<PreferencesState>('get_preferences')
 export const getUiState = () => invoke<UiState>('get_ui_state')
@@ -123,4 +139,6 @@ export const clearHistory = () => invoke<void>('clear_history')
 export const openDashboard = (settings = false) => invoke<void>('open_dashboard', { settings })
 export const hidePanel = () => invoke<void>('hide_panel')
 export const removeProvider = (providerId: ProviderId) => invoke<PreferencesState>('remove_provider', { providerId })
+export const checkForUpdates = () => invoke<UpdateCheck>('check_for_updates')
+export const openReleaseUrl = (url: string) => invoke<void>('open_release_url', { url })
 export const setWindowTheme = (theme: 'light' | 'dark' | null) => getCurrentWebviewWindow().setTheme(theme)

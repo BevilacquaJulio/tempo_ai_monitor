@@ -10,8 +10,8 @@ Em **Escanear minhas IAs** (ou **Adicionar ferramenta**), clique em **Adicionar*
 
 - **Cotas ao vivo (5 horas e 7 dias)**: o TempoAI lê (somente leitura) o token OAuth salvo pelo Claude Code em `%USERPROFILE%\.claude\.credentials.json` (ou `CLAUDE_CONFIG_DIR`) e consulta `https://api.anthropic.com/api/oauth/usage`.
   - O token permanece apenas em memória durante a requisição HTTPS (sem seguir redirecionamentos) e nunca é gravado, logado ou enviado à interface.
-  - O TempoAI **nunca renova nem sobrescreve** `.credentials.json`, evitando desconectar o Claude Code. Se o token expirar, basta abrir o Claude Code uma vez para que ele mesmo renove.
-  - Leituras saudáveis são cacheadas por 2 minutos; falhas transitórias de rede tentam novamente a partir de 30 segundos, renovações de `.credentials.json` reconectam automaticamente e respostas HTTP 429 respeitam `Retry-After` (ou aguardam 3 minutos) — além de reconexão imediata pelo botão **Tentar conectar novamente** / **Consultar uso do Claude**.
+  - O TempoAI **nunca renova nem sobrescreve** `.credentials.json`, evitando desconectar o Claude Code. Se o token expirar, o cartão mantém a última leitura salva em SQLite com horário e observa `.credentials.json` a cada 2 segundos; assim que uma sessão do Claude Code (ou o CLI) renovar a credencial, o TempoAI atualiza automaticamente.
+  - Leituras saudáveis são cacheadas por 2 minutos; falhas transitórias de rede tentam novamente a partir de 30 segundos e respostas HTTP 429 respeitam `Retry-After` (ou aguardam 3 minutos), sempre exibindo contagem regressiva ao vivo e permitindo checagem imediata pelo botão **Verificar agora** ou **Atualizar**.
 - **Histórico de sessões, tokens e cache**: o TempoAI lê em streaming (somente leitura, com cache incremental por arquivo) os metadados numéricos de `%USERPROFILE%\.claude\projects\**\*.jsonl`, extraindo exclusivamente `sessionId`, nome da pasta do projeto (`cwd` basename), `gitBranch`, `model`, timestamps e contadores de `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`), deduplicando chunks de streaming por `message.id`. **Nenhum texto de prompt, resposta ou ferramenta é lido para a interface ou salvo no SQLite.**
 
 ## OpenAI Codex (Zero-config)
@@ -20,7 +20,7 @@ Clique em **Adicionar** em **OpenAI Codex** após a varredura.
 
 - **Histórico de sessões, tokens e cache**: o TempoAI lê em streaming (somente leitura) `%USERPROFILE%\.codex\sessions\**\rollout-*.jsonl` (ou `CODEX_HOME/sessions`), extraindo metadados de `session_meta`, `turn_context` e eventos `token_count` (`input_tokens`, `cached_input_tokens`, `output_tokens`, `total_tokens`, modelo, pasta do projeto e `git.branch`), sem guardar o conteúdo das conversas.
 - **Cotas ao vivo e fallback**:
-  - Quando o executável nativo `codex.exe` é detectado automaticamente no sistema, o TempoAI consulta o [Codex App Server](https://learn.chatgpt.com/docs/app-server) via stdio (`account/read`, `account/rateLimits/read`, `account/usage/read`, `thread/list`) sem executar prompts.
+  - Quando o executável nativo `codex.exe` é detectado em uma pasta local confiável (fora de diretórios temporários/públicos ou graváveis por outros usuários), o TempoAI exibe o caminho resolvido na conexão, fixa esse executável nas preferências e consulta o [Codex App Server](https://learn.chatgpt.com/docs/app-server) via stdio (`account/read`, `account/rateLimits/read`, `account/usage/read`, `thread/list`) sem executar prompts. Se o executável mudar de caminho, o TempoAI exige nova confirmação antes de executá-lo.
   - Quando o Codex é usado sem `.exe` nativo (por exemplo via `codex.cmd` do npm) ou o App Server falha temporariamente, o TempoAI usa o snapshot mais recente de `rate_limits` gravado nos logs locais `.jsonl`.
 - O TempoAI não envia nem armazena credenciais do Codex; a autenticação continua sob controle do próprio Codex.
 
@@ -28,7 +28,7 @@ Clique em **Adicionar** em **OpenAI Codex** após a varredura.
 
 Com o Antigravity CLI `1.1.11` ou mais recente autenticado com sua conta Google, clique em **Adicionar** em **Google Antigravity**.
 
-- O TempoAI executa o comando oficial somente-leitura `agy -p /usage --output-format json` (verificando a versão antes para garantir que nenhum prompt seja enviado ao modelo).
+- O TempoAI exibe e fixa o caminho resolvido de `agy.exe` em uma pasta local confiável (rejeitando pastas compartilhadas/temporárias e exigindo nova confirmação se o executável mudar de lugar) e executa o comando oficial somente-leitura `agy -p /usage --output-format json` (verificando a versão antes para garantir que nenhum prompt seja enviado ao modelo).
 - As leituras são atualizadas periodicamente (a cada 2 minutos) e, em caso de erro transitório, o app aplica backoff de 5 minutos antes de tentar novamente automaticamente (ou imediatamente ao clicar em **Consultar uso do Antigravity**).
 
 ## Outros provedores

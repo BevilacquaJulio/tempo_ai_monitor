@@ -1,17 +1,23 @@
 use crate::{
-    core::preferences::is_local_path,
+    core::preferences::{is_local_path, resolve_local_dir, resolve_local_file},
     providers::{self, Observation},
 };
 use chrono::DateTime;
 use serde_json::{json, Value};
-use std::{fs, io::Read, path::PathBuf, sync::OnceLock, time::{Duration, SystemTime}};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::{Duration, SystemTime},
+};
 
 // Defensive parsing for the read-only OAuth usage endpoint.
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CREDENTIALS_BYTES: u64 = 16 * 1024;
 const RESPONSE_BYTES: u64 = 64 * 1024;
 pub const SIGN_IN: &str = "Sign in to Claude Code with your Claude subscription to check usage here.";
-pub const EXPIRED: &str = "Your Claude Code sign-in needs renewing. Open Claude Code once and TempoAI will pick it up.";
+pub const EXPIRED: &str = "Your Claude Code credentials expired. Start a Claude Code session (or open the CLI) and TempoAI will update automatically.";
 pub const COULD_NOT_READ: &str = "Could not check Claude usage. Check your connection and try again.";
 pub const BUSY: &str = "Claude is limiting usage checks right now. TempoAI will try again shortly.";
 
@@ -44,14 +50,26 @@ fn http_client() -> Result<&'static reqwest::blocking::Client, &'static str> {
         .ok_or(COULD_NOT_READ)
 }
 
+fn credentials_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claude")))
+        .filter(|folder| is_local_path(folder))
+}
+
+fn resolved_credentials_in(folder: &Path) -> Option<PathBuf> {
+    let resolved_dir = resolve_local_dir(folder)?;
+    let resolved_file = resolve_local_file(&resolved_dir.join(".credentials.json"))?;
+    resolved_file.starts_with(&resolved_dir).then_some(resolved_file)
+}
+
 pub fn has_credentials() -> bool {
-    credentials_path().is_some_and(|path| path.is_file())
+    credentials_dir().and_then(|dir| resolved_credentials_in(&dir)).is_some()
 }
 
 pub fn credentials_stamp() -> Option<CredentialsStamp> {
-    let metadata = fs::metadata(credentials_path()?).ok()?;
-    metadata
-        .is_file()
+    let path = credentials_dir().and_then(|dir| resolved_credentials_in(&dir))?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.file_type().is_file() && !metadata.file_type().is_symlink())
         .then(|| metadata.modified().ok().map(|modified| CredentialsStamp { modified, len: metadata.len() }))
         .flatten()
 }
@@ -61,12 +79,17 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     raw.parse::<u64>().ok().map(|seconds| Duration::from_secs(seconds.clamp(30, 300)))
 }
 
+#[cfg(test)]
 pub fn read(now: i64) -> Result<Observation, &'static str> {
     read_with_backoff(now).0
 }
 
 pub fn read_with_backoff(now: i64) -> (Result<Observation, &'static str>, Option<Duration>) {
-    let credentials = match credentials(now) {
+    let dir = match credentials_dir() {
+        Some(dir) => dir,
+        None => return (Err(SIGN_IN), None),
+    };
+    let credentials = match credentials_from_dir(&dir, now) {
         Ok(credentials) => credentials,
         Err(error) => return (Err(error), None),
     };
@@ -100,14 +123,9 @@ pub fn read_with_backoff(now: i64) -> (Result<Observation, &'static str>, Option
     (parse_usage(&usage, credentials.plan, now).ok_or(COULD_NOT_READ), None)
 }
 
-fn credentials_path() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claude")))
-        .filter(|folder| is_local_path(folder)).map(|folder| folder.join(".credentials.json"))
-}
-
-fn credentials(now: i64) -> Result<Credentials, &'static str> {
-    let file = fs::File::open(credentials_path().ok_or(SIGN_IN)?).map_err(|_| SIGN_IN)?;
+fn credentials_from_dir(folder: &Path, now: i64) -> Result<Credentials, &'static str> {
+    let path = resolved_credentials_in(folder).ok_or(SIGN_IN)?;
+    let file = fs::File::open(path).map_err(|_| SIGN_IN)?;
     let mut bytes = Vec::new();
     file.take(CREDENTIALS_BYTES + 1).read_to_end(&mut bytes).map_err(|_| SIGN_IN)?;
     if bytes.len() as u64 > CREDENTIALS_BYTES { return Err(SIGN_IN); }
@@ -155,6 +173,35 @@ mod tests {
         assert_eq!(parse_credentials(&json!({"claudeAiOauth":{"accessToken":""}}), 1000).err(), Some(SIGN_IN));
         assert_eq!(parse_credentials(&json!({"claudeAiOauth":{"accessToken":"bad\ntoken"}}), 1000).err(), Some(SIGN_IN));
         assert_eq!(parse_credentials(&json!({}), 1000).err(), Some(SIGN_IN));
+    }
+
+    #[test]
+    fn reads_local_credentials_file_and_rejects_directory_junction_and_unc_targets() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let real_dir = dir.path().join("real-claude");
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(
+            real_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-synthetic","expiresAt":2000000,"subscriptionType":"pro"}}"#,
+        )
+        .unwrap();
+
+        let creds = credentials_from_dir(&real_dir, 1000).unwrap();
+        assert_eq!(creds.token, "sk-synthetic");
+        assert_eq!(creds.plan.as_deref(), Some("Pro"));
+        assert_eq!(credentials_from_dir(Path::new(r"\\server\share\.claude"), 1000).err(), Some(SIGN_IN));
+
+        #[cfg(windows)]
+        {
+            let junction = dir.path().join("linked-claude");
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J", junction.to_str().unwrap(), real_dir.to_str().unwrap()])
+                .output();
+            if status.is_ok_and(|out| out.status.success()) {
+                assert_eq!(credentials_from_dir(&junction, 1000).err(), Some(SIGN_IN));
+                let _ = fs::remove_dir(&junction);
+            }
+        }
     }
 
     #[test]

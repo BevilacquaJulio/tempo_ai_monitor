@@ -2,8 +2,8 @@ import type { DetectedAgent, Preferences, ProviderConnection } from '@/services/
 
 export function zeroConfigConnection(agent: DetectedAgent): ProviderConnection | null {
   if (agent.id === 'claude') return { kind: 'claudeAuto' }
-  if (agent.id === 'codex') return { kind: 'codexAuto' }
-  if (agent.id === 'antigravity' && agent.sourcePath) return { kind: 'antigravityAuto' }
+  if (agent.id === 'codex') return { kind: 'codexAuto', executable: agent.sourcePath ?? null }
+  if (agent.id === 'antigravity' && agent.sourcePath) return { kind: 'antigravityAuto', executable: agent.sourcePath }
   return null
 }
 

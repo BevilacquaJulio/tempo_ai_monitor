@@ -204,6 +204,7 @@ export function OnboardingScan({ settings, saving }: Props) {
                         <span key={tag} className={`detected-tag${tag === 'Zero-config' ? ' tag-ready' : ''}`}>{t(tag)}</span>
                       ))}
                     </div>
+                    {agent.sourcePath && <code className="path-note" title={agent.sourcePath}>{agent.sourcePath}</code>}
                   </div>
                 </div>
                 <div className="detected-action">

@@ -1,4 +1,4 @@
-use crate::providers::antigravity::Reading;
+use crate::providers::{antigravity::Reading, Observation};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::Path;
@@ -11,6 +11,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     }
     if db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 1 {
         db.execute_batch(concat!("BEGIN IMMEDIATE;\n", include_str!("../../migrations/002_antigravity_reading.sql"), "\nCOMMIT;"))?;
+    }
+    if db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 2 {
+        db.execute_batch(concat!("BEGIN IMMEDIATE;\n", include_str!("../../migrations/003_claude_reading.sql"), "\nCOMMIT;"))?;
     }
     Ok(db)
 }
@@ -34,6 +37,32 @@ pub fn read_antigravity(db: &Connection) -> rusqlite::Result<Option<(String, Rea
         Ok((row.get(0)?, reading))
     })
     .optional()
+}
+
+pub fn save_claude(db: &Connection, reading: &Observation) -> rusqlite::Result<()> {
+    let payload = serde_json::to_string(reading).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    db.execute(
+        "INSERT INTO claude_reading VALUES (1, ?1, ?2)
+        ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at, payload=excluded.payload
+        WHERE excluded.observed_at >= claude_reading.observed_at",
+        params![reading.at, payload],
+    )?;
+    Ok(())
+}
+
+pub fn read_claude(db: &Connection) -> rusqlite::Result<Option<Observation>> {
+    db.query_row("SELECT payload FROM claude_reading WHERE id = 1", [], |row| {
+        let payload: String = row.get(0)?;
+        serde_json::from_str(&payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+        })
+    })
+    .optional()
+}
+
+pub fn clear_claude(db: &Connection) -> rusqlite::Result<()> {
+    db.execute("DELETE FROM claude_reading", [])?;
+    Ok(())
 }
 
 pub fn write(db: &mut Connection, provider: &str, rows: &[(i64, Value)]) -> rusqlite::Result<()> {
@@ -87,6 +116,7 @@ pub fn clear_history(db: &mut Connection, cutoff: i64) -> rusqlite::Result<()> {
 }
 
 pub fn prune(db: &Connection, session_cutoff: i64, now: i64) -> rusqlite::Result<()> {
+    db.pragma_update(None, "secure_delete", true)?;
     db.execute("DELETE FROM sessions WHERE last_activity < ?1", [session_cutoff])?;
     db.execute("DELETE FROM alert_deliveries WHERE resets_at < ?1", [now.saturating_sub(86400)])?;
     Ok(())
@@ -96,6 +126,39 @@ pub fn prune(db: &Connection, session_cutoff: i64, now: i64) -> rusqlite::Result
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn runs_v1_to_v3_migrations_on_clean_and_upgraded_databases() {
+        assert!(rusqlite::version_number() >= 3_054_000, "bundled SQLite must be >= 3.54.0");
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let fresh_path = dir.path().join("fresh.sqlite");
+        let fresh = open(&fresh_path).unwrap();
+        let version: i64 = fresh.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 3);
+
+        let v1_path = dir.path().join("v1.sqlite");
+        let raw = Connection::open(&v1_path).unwrap();
+        raw.execute_batch(include_str!("../../migrations/001_history.sql")).unwrap();
+        drop(raw);
+        let upgraded = open(&v1_path).unwrap();
+        let upgraded_version: i64 = upgraded.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(upgraded_version, 3);
+
+        let newer = Observation {
+            plan: Some("Pro".into()),
+            quotas: vec![json!({"id":"claude-five_hour-","type":"five_hour","usedPercent":42.0,"status":"available"})],
+            at: 2000,
+            daily_tokens: Vec::new(),
+        };
+        let older = Observation { at: 1000, ..newer.clone() };
+        save_claude(&upgraded, &newer).unwrap();
+        save_claude(&upgraded, &older).unwrap();
+        let loaded = read_claude(&upgraded).unwrap().unwrap();
+        assert_eq!(loaded.at, 2000);
+        assert_eq!(loaded.plan.as_deref(), Some("Pro"));
+        clear_claude(&upgraded).unwrap();
+        assert!(read_claude(&upgraded).unwrap().is_none());
+    }
 
     #[test]
     fn deduplicates_sessions_and_preserves_latest_observation() {

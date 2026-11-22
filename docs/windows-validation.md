@@ -14,7 +14,7 @@ npm.cmd run test:e2e
 npm.cmd run release
 ```
 
-`npm run release` prepara o ambiente do Visual Studio e do SDK do Windows, compila o aplicativo e gera apenas dois arquivos em `release/`: `TempoAI-<versão>-setup.exe` (instalador NSIS) e `TempoAI-<versão>-portable.exe` (executa sem instalar). Versões anteriores nessa pasta são substituídas. O projeto não configura certificado de assinatura nem publicação automática.
+`npm run release` prepara o ambiente do Visual Studio e do SDK do Windows, compila o aplicativo e gera em `release/`: `TempoAI-<versão>-setup.exe` (instalador NSIS), `TempoAI-<versão>-portable.exe` (executa sem instalar) e `SHA256SUMS.txt` (resumo SHA-256 dos binários). Versões anteriores nessa pasta são substituídas. Para distribuição pública, assine ambos os executáveis com certificado Authenticode (verificando com `Get-AuthenticodeSignature`), regere o `SHA256SUMS.txt` após assinar e publique os arquivos junto com os hashes no GitHub Releases.
 
 ## Checklist antes de publicar uma versão
 

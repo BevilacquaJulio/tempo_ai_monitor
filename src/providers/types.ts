@@ -4,6 +4,7 @@ export type DataStatus = 'available' | 'unavailable' | 'stale' | 'error'
 export type DataSource = 'official' | 'cli' | 'local' | 'demo'
 export type QuotaWindowType = 'five_hour' | 'weekly' | 'custom'
 export type IntegrationStatus = 'demo' | 'not_connected' | 'connected' | 'stale' | 'error'
+export type ProviderWaitReason = 'credentials' | 'retry'
 
 export interface QuotaWindow {
   id: string
@@ -25,6 +26,10 @@ export interface ProviderSnapshot {
   integration: IntegrationStatus
   connectionSaved?: boolean
   integrationError?: string | null
+  checking?: boolean
+  waitingFor?: ProviderWaitReason | null
+  nextRetryAt?: string | null
+  lastCheckedAt?: string | null
   quotas: QuotaWindow[]
   updatedAt: string | null
 }

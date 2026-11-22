@@ -1,5 +1,5 @@
 use crate::{
-    core::preferences::is_local_path,
+    core::preferences::is_trusted_executable_path,
     providers::{self, Collection, Observation, HISTORY_SECONDS},
 };
 use serde_json::{json, Value};
@@ -19,10 +19,8 @@ struct Rpc {
 
 impl Rpc {
     fn open(executable: &Path) -> Result<Self, &'static str> {
-        if !is_local_path(executable) || !executable.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) || !executable.is_file() {
-            return Err("Could not find the local Codex executable.");
-        }
-        let mut command = Command::new(executable);
+        let executable = is_trusted_executable_path(executable).ok_or("Could not find a trusted local Codex executable.")?;
+        let mut command = Command::new(&executable);
         command.args(["app-server", "--listen", "stdio://"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, 0x08000000);

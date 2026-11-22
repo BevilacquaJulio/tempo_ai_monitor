@@ -24,7 +24,9 @@ pub struct Preferences {
     pub shortcut: String,
     pub claude_enabled: bool,
     pub codex_enabled: bool,
+    pub codex_executable: Option<String>,
     pub antigravity_enabled: bool,
+    pub antigravity_executable: Option<String>,
     pub notifications: bool,
     pub claude_alerts: bool,
     pub codex_alerts: bool,
@@ -51,7 +53,9 @@ impl Default for Preferences {
             shortcut: "Ctrl+Alt+W".into(),
             claude_enabled: false,
             codex_enabled: false,
+            codex_executable: None,
             antigravity_enabled: false,
+            antigravity_executable: None,
             notifications: false,
             claude_alerts: true,
             codex_alerts: true,
@@ -234,6 +238,8 @@ fn apply_ui_patch(current: &mut UiState, patch: UiStatePatch) {
 
 #[derive(Default)]
 pub struct DesktopState {
+    // Serializes every read-modify-write cycle on preferences.json so concurrent saves never lose updates.
+    store_lock: Mutex<()>,
     pub config: Mutex<Preferences>,
     pub ui: Mutex<UiState>,
     pub portuguese: Mutex<Option<bool>>,
@@ -242,6 +248,60 @@ pub struct DesktopState {
     pub quick_position: Mutex<desktop::PanelPosition>,
     pub quick_save_seq: AtomicU64,
     recovery: Mutex<Recovery>,
+}
+
+impl DesktopState {
+    /// Serialized UI patch write that always pairs the latest authoritative settings and UI state on disk.
+    pub fn persist_ui_patch(&self, path: &Path, patch: UiStatePatch) -> Result<UiState, &'static str> {
+        let _guard = self.store_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if self.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
+            return Err("Local preferences could not be recovered.");
+        }
+        let settings = self.config.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let mut current_ui = self.ui.lock().unwrap_or_else(|error| error.into_inner());
+        let mut candidate = current_ui.clone();
+        apply_ui_patch(&mut candidate, patch);
+        write_store_file(path, &settings, &candidate).map_err(|_| "Could not save display preferences.")?;
+        *current_ui = candidate.clone();
+        Ok(candidate)
+    }
+
+    /// Serialized Quick Monitor bounds write that cannot overwrite concurrent provider changes.
+    pub fn persist_bounds(&self, path: &Path, bounds: QuickBounds) {
+        let _guard = self.store_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if self.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
+            return;
+        }
+        let settings = self.config.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let mut ui = self.ui.lock().unwrap_or_else(|error| error.into_inner());
+        if ui.quick_bounds == Some(bounds) {
+            return;
+        }
+        let mut candidate = ui.clone();
+        candidate.quick_bounds = Some(bounds);
+        if write_store_file(path, &settings, &candidate).is_ok() {
+            *ui = candidate;
+        }
+    }
+
+    pub fn mutate_settings<F>(&self, path: &Path, mutate: F) -> Result<(Preferences, Preferences), &'static str>
+    where
+        F: FnOnce(&mut Preferences) -> Result<(), &'static str>,
+    {
+        let _guard = self.store_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let mut current = self.config.lock().unwrap_or_else(|error| error.into_inner());
+        let ui = self.ui.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let mut recovery = self.recovery.lock().unwrap_or_else(|error| error.into_inner());
+        if recovery.block_save {
+            return Err("Local preferences could not be recovered. Fix access to local storage and restart to save changes.");
+        }
+        let mut next = current.clone();
+        mutate(&mut next)?;
+        write_store_file(path, &next, &ui).map_err(|_| "Could not save preferences.")?;
+        let previous = std::mem::replace(&mut *current, next.clone());
+        recovery.warning = None;
+        Ok((previous, next))
+    }
 }
 
 #[derive(Default)]
@@ -269,7 +329,7 @@ pub fn require_window(label: &str, allowed: &[&str], message: &'static str) -> R
 
 pub fn is_local_path(path: &Path) -> bool {
     let Some(text) = path.to_str() else { return false; };
-    if !path.is_absolute() || text.starts_with("//") || text.len() > 1024 || text.contains('\0') {
+    if !path.is_absolute() || text.starts_with("//") || text.starts_with(r"\\") || text.len() > 1024 || text.contains('\0') {
         return false;
     }
     #[cfg(windows)]
@@ -290,6 +350,196 @@ pub fn is_local_path(path: &Path) -> bool {
 fn local_drive_type(drive: u32) -> bool {
     use windows_sys::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE};
     matches!(drive, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK)
+}
+
+pub fn strip_windows_verbatim(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    #[cfg(windows)]
+    let normalized = if let Some(rest) = text.strip_prefix(r"\\?\") {
+        // Verbatim UNC paths (`\\?\UNC\server\share`) must never be treated as local drives.
+        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(r"UNC\") {
+            return None;
+        }
+        rest
+    } else {
+        text
+    };
+    #[cfg(not(windows))]
+    let normalized = text;
+    let candidate = PathBuf::from(normalized);
+    is_local_path(&candidate).then_some(candidate)
+}
+
+/// Resolves a local file, rejecting UNC/network paths, symlinks, and redirects to non-local drives.
+pub fn resolve_local_file(path: &Path) -> Option<PathBuf> {
+    if !is_local_path(path) {
+        return None;
+    }
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    let resolved = strip_windows_verbatim(&canonical)?;
+    let target_meta = fs::symlink_metadata(&resolved).ok()?;
+    (target_meta.file_type().is_file() && !target_meta.file_type().is_symlink()).then_some(resolved)
+}
+
+/// Resolves a local directory, rejecting UNC/network paths and redirects whose final target leaves local drives.
+pub fn resolve_local_dir(path: &Path) -> Option<PathBuf> {
+    if !is_local_path(path) {
+        return None;
+    }
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    let resolved = strip_windows_verbatim(&canonical)?;
+    resolved.is_dir().then_some(resolved)
+}
+
+fn is_disallowed_shared_dir(path: &Path) -> bool {
+    let lower = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    for var in ["TEMP", "TMP", "PUBLIC"] {
+        if let Some(root) = std::env::var_os(var) {
+            let root_norm = PathBuf::from(root).to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+            let root_trimmed = root_norm.trim_end_matches('\\');
+            if !root_trimmed.is_empty() && (lower == root_trimmed || lower.starts_with(&format!("{root_trimmed}\\"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn is_writable_by_other_users(path: &Path) -> bool {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, LocalFree},
+        Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+            WinAuthenticatedUserSid, WinBuiltinUsersSid, WinWorldSid,
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+            INHERIT_ONLY_ACE, PSECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
+        },
+    };
+
+    const WRITE_MASK: u32 = 0x0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0010 // FILE_WRITE_EA
+        | 0x0040 // FILE_DELETE_CHILD
+        | 0x0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return true;
+    }
+    struct SdGuard(PSECURITY_DESCRIPTOR);
+    impl Drop for SdGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0); }
+            }
+        }
+    }
+    let _guard = SdGuard(sd);
+    // A NULL DACL grants full access to Everyone on Windows.
+    if dacl.is_null() {
+        return true;
+    }
+
+    let mut untrusted_sids: Vec<Vec<u8>> = Vec::with_capacity(3);
+    for sid_kind in [WinWorldSid, WinAuthenticatedUserSid, WinBuiltinUsersSid] {
+        let mut buf = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = buf.len() as u32;
+        if unsafe { CreateWellKnownSid(sid_kind, ptr::null_mut(), buf.as_mut_ptr().cast(), &mut size) } != 0 {
+            untrusted_sids.push(buf);
+        }
+    }
+    if untrusted_sids.is_empty() {
+        return true;
+    }
+
+    let mut info = ACL_SIZE_INFORMATION::default();
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return true;
+    }
+
+    for index in 0..info.AceCount {
+        let mut ace_ptr: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
+            continue;
+        }
+        let ace = unsafe { &*(ace_ptr.cast::<ACCESS_ALLOWED_ACE>()) };
+        if ace.Header.AceType != 0 || u32::from(ace.Header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+            continue;
+        }
+        if ace.Mask & WRITE_MASK == 0 {
+            continue;
+        }
+        let ace_sid = (&ace.SidStart as *const u32).cast::<c_void>().cast_mut();
+        if untrusted_sids.iter().any(|sid| unsafe { EqualSid(ace_sid, sid.as_ptr().cast::<c_void>().cast_mut()) } != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn is_writable_by_other_users(_path: &Path) -> bool {
+    false
+}
+
+/// Resolves and validates a local `.exe` outside temp/public folders and not writable by other local users.
+pub fn is_trusted_executable_path(path: &Path) -> Option<PathBuf> {
+    let resolved = resolve_local_file(path)?;
+    if !resolved.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+        return None;
+    }
+    let parent = resolved.parent()?;
+    if is_disallowed_shared_dir(&resolved) || is_disallowed_shared_dir(parent) {
+        return None;
+    }
+    if is_writable_by_other_users(&resolved) || is_writable_by_other_users(parent) {
+        return None;
+    }
+    Some(resolved)
+}
+
+fn is_valid_saved_executable_syntax(path: &str) -> bool {
+    let candidate = Path::new(path);
+    is_local_path(candidate)
+        && candidate.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
 fn write_store_file(path: &Path, settings: &Preferences, ui: &UiState) -> io::Result<()> {
@@ -378,6 +628,7 @@ pub fn initialize(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let (mut settings, ui, recovery) = load_store_file(&store_path(app));
     settings.autostart = app.autolaunch().is_enabled().unwrap_or(false);
     let state = app.state::<DesktopState>();
+    let _guard = state.store_lock.lock().unwrap_or_else(|error| error.into_inner());
     *state.recovery.lock().unwrap_or_else(|error| error.into_inner()) = recovery;
     *state.config.lock().unwrap_or_else(|error| error.into_inner()) = settings.clone();
     if let Some(portuguese) = ui.language.as_deref().map(|lang| lang == "pt-BR") {
@@ -433,19 +684,8 @@ pub fn get_ui_state(state: State<'_, DesktopState>) -> UiState {
 #[tauri::command]
 pub fn save_ui_state(app: AppHandle, window: WebviewWindow, state: State<'_, DesktopState>, ui: UiStatePatch) -> Result<UiState, String> {
     require_window(window.label(), &["main", "quick"], "Open TempoAI to save display preferences.")?;
-    let settings = state.config.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    if state.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
-        return Err("Local preferences could not be recovered.".into());
-    }
     let language_changed = ui.language.is_some();
-    let next = {
-        let mut current_ui = state.ui.lock().unwrap_or_else(|error| error.into_inner());
-        let mut candidate = current_ui.clone();
-        apply_ui_patch(&mut candidate, ui);
-        write_store_file(&store_path(&app), &settings, &candidate).map_err(|_| "Could not save display preferences.")?;
-        *current_ui = candidate.clone();
-        candidate
-    };
+    let next = state.persist_ui_patch(&store_path(&app), ui).map_err(str::to_owned)?;
     if language_changed {
         if let Some(portuguese) = next.language.as_deref().map(|lang| lang == "pt-BR") {
             let _ = desktop::apply_desktop_language(&app, portuguese);
@@ -456,21 +696,17 @@ pub fn save_ui_state(app: AppHandle, window: WebviewWindow, state: State<'_, Des
 }
 
 pub fn persist_quick_bounds(app: &AppHandle, bounds: QuickBounds) {
-    let state = app.state::<DesktopState>();
-    if state.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
-        return;
-    }
-    let settings = state.config.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    let mut ui = state.ui.lock().unwrap_or_else(|error| error.into_inner());
-    if ui.quick_bounds == Some(bounds) {
-        return;
-    }
-    ui.quick_bounds = Some(bounds);
-    let _ = write_store_file(&store_path(app), &settings, &ui);
+    app.state::<DesktopState>().persist_bounds(&store_path(app), bounds);
 }
 
 fn validate_preferences(settings: &Preferences) -> Result<Shortcut, PreferenceError> {
     discovery::validate_local_providers(&settings.local_providers)?;
+    if settings.codex_executable.as_deref().is_some_and(|path| !is_valid_saved_executable_syntax(path)) {
+        return Err("The Codex executable path is not valid.".into());
+    }
+    if settings.antigravity_executable.as_deref().is_some_and(|path| !is_valid_saved_executable_syntax(path)) {
+        return Err("The Antigravity executable path is not valid.".into());
+    }
     if settings.thresholds.iter().any(|value| ![80, 90, 95, 100].contains(value)) {
         return Err("Unsupported alert threshold.".into());
     }
@@ -481,16 +717,42 @@ fn validate_preferences(settings: &Preferences) -> Result<Shortcut, PreferenceEr
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ProviderConnection {
     ClaudeAuto,
-    CodexAuto,
-    AntigravityAuto,
+    CodexAuto {
+        #[serde(default)]
+        executable: Option<String>,
+    },
+    AntigravityAuto {
+        #[serde(default)]
+        executable: Option<String>,
+    },
     Local { source: LocalProvider },
+}
+
+fn pin_executable(raw: Option<String>, invalid_msg: &'static str) -> Result<Option<String>, &'static str> {
+    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(path) => {
+            let trusted = is_trusted_executable_path(Path::new(path)).ok_or(invalid_msg)?;
+            let text = trusted.to_str().ok_or(invalid_msg)?;
+            Ok(Some(text.to_owned()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn apply_connection(settings: &mut Preferences, connection: ProviderConnection) -> Result<(), &'static str> {
     match connection {
         ProviderConnection::ClaudeAuto => settings.claude_enabled = true,
-        ProviderConnection::CodexAuto => settings.codex_enabled = true,
-        ProviderConnection::AntigravityAuto => settings.antigravity_enabled = true,
+        ProviderConnection::CodexAuto { executable } => {
+            let pinned = pin_executable(executable, "The Codex executable is not in a trusted local folder.")?;
+            settings.codex_enabled = true;
+            settings.codex_executable = pinned;
+        }
+        ProviderConnection::AntigravityAuto { executable } => {
+            let pinned = pin_executable(executable, "The Antigravity CLI is not in a trusted local folder.")?;
+            settings.antigravity_enabled = true;
+            settings.antigravity_executable = pinned
+                .or_else(|| discovery::antigravity_executable().and_then(|p| p.to_str().map(str::to_owned)));
+        }
         ProviderConnection::Local { source } => {
             settings.local_providers.retain(|item| item.id != source.id);
             settings.local_providers.push(source);
@@ -506,18 +768,8 @@ pub async fn connect_provider(app: AppHandle, window: WebviewWindow, connection:
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<DesktopState>();
         let monitor = app.state::<monitor::Monitor>();
-        {
-            let mut current = state.config.lock().unwrap_or_else(|error| error.into_inner());
-            let ui = state.ui.lock().unwrap_or_else(|error| error.into_inner()).clone();
-            let mut recovery = state.recovery.lock().unwrap_or_else(|error| error.into_inner());
-            if recovery.block_save { return Err("Local preferences could not be recovered. Fix access to local storage and restart to save changes."); }
-            let mut next = current.clone();
-            apply_connection(&mut next, connection)?;
-            write_store_file(&monitor.preferences_path(), &next, &ui).map_err(|_| "Could not save preferences.")?;
-            monitor.reset_changed_sources(&current, &next);
-            *current = next;
-            recovery.warning = None;
-        }
+        let (previous, next) = state.mutate_settings(&monitor.preferences_path(), |settings| apply_connection(settings, connection))?;
+        monitor.reset_changed_sources(&previous, &next);
         let _ = app.emit("preferences-updated", ());
         monitor::queue(&app, true);
         Ok(get_preferences(state))
@@ -527,9 +779,13 @@ pub async fn connect_provider(app: AppHandle, window: WebviewWindow, connection:
 fn remove_connection(settings: &mut Preferences, provider_id: &str) -> Result<(), &'static str> {
     match provider_id {
         "claude" => settings.claude_enabled = false,
-        "codex" => settings.codex_enabled = false,
+        "codex" => {
+            settings.codex_enabled = false;
+            settings.codex_executable = None;
+        }
         "antigravity" | "local-antigravity" => {
             settings.antigravity_enabled = false;
+            settings.antigravity_executable = None;
             settings.local_providers.retain(|source| source.id != "local-antigravity");
         }
         id if id.starts_with("local-") && settings.local_providers.iter().any(|source| source.id == id) => {
@@ -546,18 +802,8 @@ pub async fn remove_provider(app: AppHandle, window: WebviewWindow, provider_id:
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<DesktopState>();
         let monitor = app.state::<monitor::Monitor>();
-        {
-            let mut current = state.config.lock().unwrap_or_else(|error| error.into_inner());
-            let ui = state.ui.lock().unwrap_or_else(|error| error.into_inner()).clone();
-            let mut recovery = state.recovery.lock().unwrap_or_else(|error| error.into_inner());
-            if recovery.block_save { return Err("Local preferences could not be recovered. Fix access to local storage and restart to save changes."); }
-            let mut next = current.clone();
-            remove_connection(&mut next, &provider_id)?;
-            write_store_file(&monitor.preferences_path(), &next, &ui).map_err(|_| "Could not save preferences.")?;
-            monitor.reset_changed_sources(&current, &next);
-            *current = next;
-            recovery.warning = None;
-        }
+        let (previous, next) = state.mutate_settings(&monitor.preferences_path(), |settings| remove_connection(settings, &provider_id))?;
+        monitor.reset_changed_sources(&previous, &next);
         let _ = app.emit("preferences-updated", ());
         monitor::queue(&app, true);
         Ok(get_preferences(state))
@@ -568,6 +814,7 @@ pub async fn remove_provider(app: AppHandle, window: WebviewWindow, provider_id:
 pub fn save_preferences(app: AppHandle, window: WebviewWindow, state: State<'_, DesktopState>, settings: Preferences) -> Result<PreferencesState, PreferenceError> {
     require_window(window.label(), &["main"], "Use the dashboard to change these preferences.")?;
     let candidate = validate_preferences(&settings)?;
+    let _store_guard = state.store_lock.lock().unwrap_or_else(|error| error.into_inner());
     let mut current = state.config.lock().unwrap_or_else(|error| error.into_inner());
     let ui = state.ui.lock().unwrap_or_else(|error| error.into_inner()).clone();
     if state.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
@@ -606,6 +853,7 @@ pub fn save_preferences(app: AppHandle, window: WebviewWindow, state: State<'_, 
     drop(recovery);
     drop(active);
     drop(current);
+    drop(_store_guard);
     let _ = app.emit("preferences-updated", ());
     if sources_changed {
         let _ = app.emit("usage-updated", ());
@@ -617,16 +865,10 @@ pub fn save_preferences(app: AppHandle, window: WebviewWindow, state: State<'_, 
 #[tauri::command]
 pub fn set_pin(app: AppHandle, window: WebviewWindow, state: State<'_, DesktopState>, pinned: bool) -> Result<(), String> {
     require_window(window.label(), &["quick"], "Use Quick Monitor to change the panel pin.")?;
-    let mut config = state.config.lock().unwrap_or_else(|error| error.into_inner());
-    let ui = state.ui.lock().unwrap_or_else(|error| error.into_inner()).clone();
-    if state.recovery.lock().unwrap_or_else(|error| error.into_inner()).block_save {
-        return Err("Could not recover preferences to save the panel pin.".into());
-    }
-    let mut settings = config.clone();
-    settings.pin_panel = pinned;
-    write_store_file(&store_path(&app), &settings, &ui).map_err(|_| "Could not save preferences.")?;
-    *config = settings;
-    drop(config);
+    state.mutate_settings(&store_path(&app), |settings| {
+        settings.pin_panel = pinned;
+        Ok(())
+    }).map_err(str::to_owned)?;
     let _ = app.emit("preferences-updated", ());
     Ok(())
 }
@@ -634,6 +876,7 @@ pub fn set_pin(app: AppHandle, window: WebviewWindow, state: State<'_, DesktopSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn preserves_corrupt_preferences_before_saving_defaults() {
@@ -660,6 +903,62 @@ mod tests {
         assert!(load_store_file(&path).2.warning.unwrap().contains("preferences.json.bak.1"));
         assert_eq!(fs::read(&backup).unwrap(), damaged);
         assert_eq!(fs::read(path.with_file_name("preferences.json.bak.1")).unwrap(), later_damage);
+    }
+
+    #[test]
+    fn concurrent_provider_removal_with_ui_and_bounds_saves_never_re_enables_removed_provider() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = Arc::new(directory.path().join("preferences.json"));
+        let state = Arc::new(DesktopState::default());
+
+        for round in 0..25 {
+            state.mutate_settings(&path, |s| {
+                s.claude_enabled = true;
+                s.codex_enabled = true;
+                Ok(())
+            }).unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let s1 = Arc::clone(&state);
+            let p1 = Arc::clone(&path);
+            let b1 = Arc::clone(&barrier);
+            let t_remove = std::thread::spawn(move || {
+                b1.wait();
+                s1.mutate_settings(&p1, |s| remove_connection(s, "claude")).unwrap();
+            });
+
+            let s2 = Arc::clone(&state);
+            let p2 = Arc::clone(&path);
+            let b2 = Arc::clone(&barrier);
+            let t_ui = std::thread::spawn(move || {
+                b2.wait();
+                s2.persist_ui_patch(&p2, UiStatePatch {
+                    theme: Some(if round % 2 == 0 { "dark" } else { "light" }.into()),
+                    font_scale: Some(115),
+                    ..UiStatePatch::default()
+                }).unwrap();
+            });
+
+            let s3 = Arc::clone(&state);
+            let p3 = Arc::clone(&path);
+            let b3 = Arc::clone(&barrier);
+            let bounds = QuickBounds { x: 40 + round, y: 80, width: 350, height: 430 };
+            let t_bounds = std::thread::spawn(move || {
+                b3.wait();
+                s3.persist_bounds(&p3, bounds);
+            });
+
+            t_remove.join().unwrap();
+            t_ui.join().unwrap();
+            t_bounds.join().unwrap();
+
+            let (reloaded_settings, reloaded_ui, recovery) = load_store_file(&path);
+            assert!(recovery.warning.is_none());
+            assert!(!reloaded_settings.claude_enabled, "round {round}: removed provider returned on disk");
+            assert!(reloaded_settings.codex_enabled);
+            assert_eq!(reloaded_ui.font_scale, 115);
+            assert_eq!(reloaded_ui.quick_bounds, Some(bounds));
+        }
     }
 
     #[test]
@@ -703,19 +1002,30 @@ mod tests {
     }
 
     #[test]
-    fn zero_config_connections_and_removals_preserve_other_tools() {
+    fn zero_config_connections_pin_and_clear_trusted_executables() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let codex_exe = dir.path().join("codex.exe");
+        let agy_exe = dir.path().join("agy.exe");
+        fs::write(&codex_exe, "synthetic").unwrap();
+        fs::write(&agy_exe, "synthetic").unwrap();
         let source = LocalProvider { id: "local-a".into(), name: "A".into(), path: "C:/a.json".into() };
         let mut settings = Preferences::default();
+
         apply_connection(&mut settings, ProviderConnection::ClaudeAuto).unwrap();
-        apply_connection(&mut settings, ProviderConnection::CodexAuto).unwrap();
-        apply_connection(&mut settings, ProviderConnection::AntigravityAuto).unwrap();
+        apply_connection(&mut settings, ProviderConnection::CodexAuto { executable: Some(codex_exe.to_str().unwrap().into()) }).unwrap();
+        apply_connection(&mut settings, ProviderConnection::AntigravityAuto { executable: Some(agy_exe.to_str().unwrap().into()) }).unwrap();
         apply_connection(&mut settings, ProviderConnection::Local { source }).unwrap();
+
         assert!(settings.claude_enabled && settings.codex_enabled && settings.antigravity_enabled && settings.local_providers.len() == 1);
+        assert!(settings.codex_executable.is_some());
+        assert!(settings.antigravity_executable.is_some());
 
         remove_connection(&mut settings, "claude").unwrap();
         assert!(!settings.claude_enabled && settings.codex_enabled && settings.antigravity_enabled);
+        remove_connection(&mut settings, "codex").unwrap();
+        assert!(!settings.codex_enabled && settings.codex_executable.is_none());
         remove_connection(&mut settings, "antigravity").unwrap();
-        assert!(!settings.antigravity_enabled);
+        assert!(!settings.antigravity_enabled && settings.antigravity_executable.is_none());
         remove_connection(&mut settings, "local-a").unwrap();
         assert!(settings.local_providers.is_empty());
         assert!(remove_connection(&mut settings, "local-a").is_err());
@@ -759,10 +1069,16 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn rejects_unc_and_network_drives_by_type() {
+    fn rejects_unc_verbatim_unc_temp_dirs_and_network_drives() {
         use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOTE};
         assert!(!is_local_path(Path::new(r"\\server\share\export")));
+        assert!(strip_windows_verbatim(Path::new(r"\\?\UNC\server\share\file.json")).is_none());
         assert!(!local_drive_type(DRIVE_REMOTE));
         assert!(local_drive_type(DRIVE_FIXED));
+
+        let temp_file = std::env::temp_dir().join("tempoai-untrusted-test.exe");
+        let _ = fs::write(&temp_file, "test");
+        assert!(is_trusted_executable_path(&temp_file).is_none());
+        let _ = fs::remove_file(&temp_file);
     }
 }

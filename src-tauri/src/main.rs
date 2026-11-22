@@ -3,7 +3,7 @@
 mod core;
 mod providers;
 
-use core::{desktop, monitor, preferences};
+use core::{desktop, monitor, preferences, updates};
 use providers::discovery;
 use std::time::Duration;
 use tauri::Manager;
@@ -42,9 +42,17 @@ fn main() {
             if open_panel { desktop::toggle_quick(app.handle(), None); }
             else if !autostart { desktop::show_main(app.handle(), false); }
             let handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                monitor::queue(&handle, false);
-                std::thread::sleep(Duration::from_secs(15));
+            std::thread::spawn(move || {
+                let mut tick: u8 = 0;
+                loop {
+                    if tick == 0 {
+                        monitor::queue(&handle, false);
+                    } else {
+                        monitor::poll_fast_watches(&handle);
+                    }
+                    tick = (tick + 1) % 8;
+                    std::thread::sleep(Duration::from_secs(2));
+                }
             });
             Ok(())
         })
@@ -55,6 +63,7 @@ fn main() {
             desktop::open_dashboard, desktop::hide_panel, desktop::set_desktop_language,
             discovery::scan_providers,
             monitor::usage_snapshot, monitor::session_history, monitor::request_refresh, monitor::refresh_claude, monitor::refresh_antigravity, monitor::test_saved_integrations, monitor::data_location, monitor::clear_history,
+            updates::check_for_updates, updates::open_release_url,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start TempoAI");

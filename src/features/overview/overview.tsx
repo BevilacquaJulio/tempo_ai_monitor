@@ -32,7 +32,9 @@ export function Overview({ query, demo, refresh, scan, settings, saving = false 
     const at = trustedReset(quota)
     return at === null ? [] : [{ id: `${provider.providerId}/${quota.id}/${at}`, at }]
   })) ?? [], [data])
-  const now = useClock(Boolean(data?.providers.some(({ quotas }) => quotas.some(({ resetAt }) => resetAt))), 30_000)
+  const hasActiveRetry = Boolean(data?.providers.some(({ waitingFor, nextRetryAt }) => waitingFor === 'retry' && Boolean(nextRetryAt)))
+  const hasReset = Boolean(data?.providers.some(({ quotas }) => quotas.some(({ resetAt }) => resetAt)))
+  const now = useClock(hasActiveRetry || hasReset, hasActiveRetry ? 1_000 : 30_000)
   const requested = useRef(new Set<string>())
   useEffect(() => {
     if (isFetching || isError) return

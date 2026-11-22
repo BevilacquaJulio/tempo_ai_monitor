@@ -1,9 +1,9 @@
-import { ChevronDown, Ellipsis, RefreshCw, Trash2 } from 'lucide-react'
+import { ChevronDown, Clock3, Ellipsis, LoaderCircle, RefreshCw, Trash2 } from 'lucide-react'
 import { Dialog, DropdownMenu } from 'radix-ui'
 import { useState } from 'react'
 import { ProviderQuotaSkeleton, StatusIndicator } from '@/components/shared/states'
-import { formatDateTime, formatPercent } from '@/lib/format'
-import { currentUsage, isPercentage, quotaLabel, usageLevel } from '@/providers/quotas'
+import { formatDateTime, formatPercent, formatTimeWithSeconds } from '@/lib/format'
+import { countdown, currentUsage, isPercentage, isResetDue, quotaLabel, usageLevel } from '@/providers/quotas'
 import type { IntegrationStatus, ProviderId, ProviderSnapshot } from '@/providers/types'
 import { ProviderMark } from './provider-mark'
 import { QuotaCard, useShareText } from './quota-card'
@@ -13,6 +13,10 @@ import { Button } from '@/components/ui/button'
 import { desktop, refreshAntigravity, refreshClaude, refreshDesktop, removeProvider, type PreferencesState } from '@/services/desktop'
 
 const isAntigravity = (id: ProviderId) => id === 'antigravity' || id === 'local-antigravity'
+
+const CLAUDE_EXPIRED = 'Your Claude Code credentials expired. Start a Claude Code session (or open the CLI) and TempoAI will update automatically.'
+const CLAUDE_SIGN_IN = 'Sign in to Claude Code with your Claude subscription to check usage here.'
+const CLAUDE_BUSY = 'Claude is limiting usage checks right now. TempoAI will try again shortly.'
 
 const integrationStatus = {
   demo: { label: 'Sample data', tone: 'accent' },
@@ -26,8 +30,11 @@ export function isInitialLoading(provider: ProviderSnapshot) {
   return Boolean(provider.connectionSaved && provider.integration === 'not_connected' && !provider.updatedAt && !provider.integrationError)
 }
 
-export function IntegrationIndicator({ status, saved, loading = false }: { status: IntegrationStatus; saved?: boolean; loading?: boolean }) {
+export function IntegrationIndicator({ status, saved, loading = false, checking = false }: {
+  status: IntegrationStatus; saved?: boolean; loading?: boolean; checking?: boolean
+}) {
   if (loading) return <StatusIndicator label="Loading…" tone="accent" />
+  if (checking) return <StatusIndicator label="Checking…" tone="accent" />
   if (status === 'error') return <StatusIndicator {...integrationStatus.error} />
   if (saved && status !== 'connected' && status !== 'demo') return <StatusIndicator label="Connection saved" tone="accent" />
   return <StatusIndicator {...integrationStatus[status]} />
@@ -44,7 +51,16 @@ export function showSavedReading(provider: ProviderSnapshot) {
     (provider.integration === 'not_connected' || provider.integration === 'error'))
 }
 
-function useUsageCheck(providerId: ProviderId) {
+function parseTimestamp(value: string | null | undefined): number | null {
+  if (!value) return null
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function useUsageCheck(providerId: ProviderId, callbacks?: {
+  onSuccess?: () => void
+  onError?: (error: unknown) => void
+}) {
   const client = useQueryClient()
   const mutationFn = isAntigravity(providerId)
     ? refreshAntigravity
@@ -53,53 +69,105 @@ function useUsageCheck(providerId: ProviderId) {
       : refreshDesktop
   return useMutation<void, unknown>({
     mutationFn,
+    onSuccess: () => callbacks?.onSuccess?.(),
+    onError: (error) => callbacks?.onError?.(error),
     onSettled: () => client.invalidateQueries({ queryKey: ['usage'] }),
   })
 }
 
 export function ProviderUsageAction({ provider }: { provider: ProviderSnapshot }) {
-  const { t } = useLocale()
+  const { t, language } = useLocale()
   const antigravity = isAntigravity(provider.providerId)
   const claude = provider.providerId === 'claude'
   const reconnecting = provider.integration === 'error' || provider.integration === 'not_connected'
-  const check = useUsageCheck(provider.providerId)
-  if (!desktop || provider.integration === 'demo' || (!antigravity && !claude && !reconnecting)) return null
-  const label = reconnecting ? 'Try connecting again' : antigravity ? 'Check Antigravity usage' : 'Check Claude usage'
-  const pendingLabel = reconnecting ? 'Connecting…' : 'Checking usage…'
+  const [feedback, setFeedback] = useState<{ kind: 'ok' | 'error'; text: string; count: number } | null>(null)
   const fallback = antigravity
     ? 'Could not complete the Antigravity usage check.'
     : claude
       ? 'Could not complete the Claude usage check.'
       : 'Could not refresh usage.'
-  const errorMessage = check.isError ? (typeof check.error === 'string' ? check.error : fallback) : null
-  const alertText = errorMessage && errorMessage === provider.integrationError ? 'Still could not connect.' : errorMessage
+  const check = useUsageCheck(provider.providerId, {
+    onSuccess: () => {
+      const time = formatTimeWithSeconds(Date.now(), language)
+      const text = antigravity
+        ? t('Checked at {time}: Antigravity usage updated.', { time })
+        : claude
+          ? t('Checked at {time}: Claude usage updated.', { time })
+          : t('Checked at {time}: usage updated.', { time })
+      setFeedback((prev) => ({ kind: 'ok', text, count: (prev?.count ?? 0) + 1 }))
+    },
+    onError: (error) => {
+      const time = formatTimeWithSeconds(Date.now(), language)
+      const raw = typeof error === 'string' ? error : fallback
+      const text = raw === CLAUDE_EXPIRED
+        ? t('Checked at {time}: Claude Code credentials are still expired. TempoAI will update as soon as Claude Code renews the session.', { time })
+        : raw === CLAUDE_SIGN_IN
+          ? t('Checked at {time}: no Claude Code sign-in found yet.', { time })
+          : raw === CLAUDE_BUSY
+            ? t('Checked at {time}: Claude is still limiting checks right now.', { time })
+            : t('Checked at {time}: {reason}', { time, reason: t(raw) })
+      setFeedback((prev) => ({ kind: 'error', text, count: (prev?.count ?? 0) + 1 }))
+    },
+  })
+  const canCheck = antigravity || claude || reconnecting || provider.integration === 'stale'
+  if (!desktop || provider.integration === 'demo' || !canCheck) return null
+  const busy = check.isPending || Boolean(provider.checking)
   return <div className="provider-usage-action">
-    <Button variant="outline" disabled={check.isPending} onClick={() => check.mutate()}>
-      <RefreshCw className={check.isPending ? 'spin' : undefined} aria-hidden="true" />
-      {t(check.isPending ? pendingLabel : label)}
+    <Button variant="outline" disabled={busy} onClick={() => check.mutate()}>
+      <RefreshCw className={busy ? 'spin' : undefined} aria-hidden="true" />
+      {t(busy ? 'Checking…' : 'Check now')}
     </Button>
-    {alertText && <p role="alert">{t(alertText)}</p>}
-    {antigravity && check.isSuccess && <p role="status">{t('Antigravity usage checked.')}</p>}
-    {claude && check.isSuccess && <p role="status">{t('Claude usage checked.')}</p>}
+    {feedback && <p key={feedback.count} className="action-feedback" role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.text}</p>}
   </div>
 }
 
-export function StaleProviderUsage({ provider }: { provider: ProviderSnapshot }) {
+export function StaleProviderUsage({ provider, now }: { provider: ProviderSnapshot; now: number }) {
   const { t, language } = useLocale()
   const saved = provider.quotas.flatMap((quota) => isPercentage(quota.usedPercent) ? [{ quota, used: quota.usedPercent }] : [])
   const message = provider.integrationError
     ? t(provider.integrationError)
     : t(refreshHelp[provider.providerId] ?? 'Open the tool to check your current usage, then click Refresh in TempoAI.')
+  const retryAt = provider.waitingFor === 'retry' ? parseTimestamp(provider.nextRetryAt) : null
+  const waitNotice = provider.checking
+    ? { kind: 'checking' as const, text: t('Checking current usage…') }
+    : provider.waitingFor === 'credentials'
+      ? { kind: 'credentials' as const, text: t('Waiting for Claude Code to renew · checking automatically every 2s') }
+      : provider.waitingFor === 'retry'
+        ? {
+            kind: 'retry' as const,
+            text: retryAt !== null && retryAt > now
+              ? t('Next automatic retry in {time}', { time: countdown(retryAt, now) })
+              : t('Starting automatic retry…'),
+          }
+        : null
+
   return <div className="stale-provider" data-error={provider.integration === 'error' || undefined}>
     <p>{message}</p>
-    {saved.length > 0 && <details>
-      <summary>{t('See last reading')}</summary>
-      {provider.updatedAt && <p>{t('Last observed {time}', { time: formatDateTime(provider.updatedAt, language) })}</p>}
-      <ul>{saved.map(({ quota, used }) => <li key={quota.id}>
-        <span>{quotaLabel(quota, provider.providerId, t)}</span>
-        <span>{t('{value}% used', { value: formatPercent(used, language) })}</span>
-      </li>)}</ul>
-    </details>}
+    {waitNotice && <p className={`wait-status is-${waitNotice.kind}`} role="status">
+      {waitNotice.kind === 'checking'
+        ? <LoaderCircle className="spin" aria-hidden="true" />
+        : waitNotice.kind === 'retry'
+          ? <Clock3 aria-hidden="true" />
+          : <span className="wait-dot" aria-hidden="true" />}
+      <span>{waitNotice.text}</span>
+    </p>}
+    {saved.length > 0 && <div className="last-reading">
+      <p className="last-reading-head">
+        {provider.updatedAt
+          ? t('Last reading · {time}', { time: formatDateTime(provider.updatedAt, language) })
+          : t('Last reading')}
+      </p>
+      <ul>{saved.map(({ quota, used }) => {
+        const resetPassed = isResetDue(quota, now)
+        return <li key={quota.id}>
+          <span>{quotaLabel(quota, provider.providerId, t)}</span>
+          <span className="last-reading-value">
+            <strong>{t('{value}% used', { value: formatPercent(used, language) })}</strong>
+            {resetPassed && <small>{t('Reset passed')}</small>}
+          </span>
+        </li>
+      })}</ul>
+    </div>}
   </div>
 }
 
@@ -191,7 +259,7 @@ export function ProviderCard({ provider, now, collapsed = false, onToggleCollaps
     <header className="provider-header">
       <ProviderMark id={provider.providerId} />
       <div className="provider-title"><h3>{provider.displayName}</h3>{provider.planName && <p>{t('{name} plan', { name: provider.planName })}</p>}</div>
-      <IntegrationIndicator status={integration} saved={provider.connectionSaved} loading={loading} />
+      <IntegrationIndicator status={integration} saved={provider.connectionSaved} loading={loading} checking={Boolean(provider.checking)} />
       {desktop && provider.connectionSaved && <ProviderMenu provider={provider} />}
       {onToggleCollapsed && <CollapseButton name={provider.displayName} expanded={!collapsed} controls={body} onToggle={onToggleCollapsed} />}
     </header>
@@ -199,7 +267,7 @@ export function ProviderCard({ provider, now, collapsed = false, onToggleCollaps
       {loading ? (
         <ProviderQuotaSkeleton />
       ) : showSavedReading(provider) ? <>
-        <StaleProviderUsage provider={provider} />
+        <StaleProviderUsage provider={provider} now={now} />
         <ProviderUsageAction provider={provider} />
       </> : <>
         <div className="quota-list">{provider.quotas.map((quota) => <QuotaCard key={quota.id} quota={quota} provider={provider.providerId} now={now} />)}</div>

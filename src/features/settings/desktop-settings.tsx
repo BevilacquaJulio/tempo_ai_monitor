@@ -1,4 +1,5 @@
 import { useLocale } from '@/lib/locale'
+import { Download, ExternalLink, RefreshCw } from 'lucide-react'
 import { Dialog, Switch } from 'radix-ui'
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
@@ -7,10 +8,10 @@ import { ErrorState, LoadingState, RefreshNotice } from '@/components/shared/sta
 import { IntegrationIndicator, isInitialLoading, RemoveProviderDialog } from '@/components/providers/provider-card'
 import { ProviderMark } from '@/components/providers/provider-mark'
 import { Button } from '@/components/ui/button'
-import { formatDateTime } from '@/lib/format'
+import { formatDateTime, formatDay, formatTimeWithSeconds } from '@/lib/format'
 import { providerName } from '@/providers/registry'
 import type { ProviderSnapshot, UsageSnapshot } from '@/providers/types'
-import { clearHistory, getDataLocation, testSavedIntegrations, type PreferenceField, type Preferences, type PreferencesState } from '@/services/desktop'
+import { checkForUpdates, clearHistory, getDataLocation, openReleaseUrl, testSavedIntegrations, type PreferenceField, type Preferences, type PreferencesState, type UpdateCheck } from '@/services/desktop'
 import { AppearanceSection, SettingRow, SettingsSection } from './settings'
 import type { usePreferencesDraft } from './use-preferences-draft'
 
@@ -127,6 +128,8 @@ function PreferencesForm({ state, editor, data, reloadUsage, scan }: { state: Pr
         } />
       </SettingsSection>
 
+      <UpdatesSection />
+
       <SettingsSection title="Your data" description="TempoAI keeps usage numbers and session names on this computer only. It never saves your conversations or passwords.">
         <SettingRow title="Activity history" description="Clearing it does not change anything in your AI tools." value={
           <Dialog.Root open={confirm} onOpenChange={(open) => { if (!clear.isPending) setConfirm(open) }}>
@@ -189,6 +192,85 @@ function IntegrationCheck({ data, state, reloadUsage }: { data?: UsageSnapshot; 
       {check.isError && <p role="alert" className="form-error">{t('Could not check connections. Try again.')}</p>}
     </div>
   </>
+}
+
+function UpdatesSection() {
+  const { t, language } = useLocale()
+  const [checkedAt, setCheckedAt] = useState<{ at: number; count: number } | null>(null)
+  const check = useMutation<UpdateCheck, unknown>({
+    mutationFn: () => checkForUpdates(),
+    onSettled: () => setCheckedAt((prev) => ({ at: Date.now(), count: (prev?.count ?? 0) + 1 })),
+  })
+  const open = useMutation<void, unknown, string>({
+    mutationFn: (url) => openReleaseUrl(url),
+  })
+  const currentVersion = check.data?.currentVersion ?? __APP_VERSION__
+  const result = check.data
+  const checkedTime = checkedAt ? formatTimeWithSeconds(checkedAt.at, language) : null
+  const primaryDownload = result?.status === 'update_available'
+    ? result.runningPortable && result.portableUrl
+      ? { url: result.portableUrl, label: 'Download portable (.exe)' }
+      : result.installerUrl
+        ? { url: result.installerUrl, label: 'Download installer (.exe)' }
+        : result.portableUrl
+          ? { url: result.portableUrl, label: 'Download portable (.exe)' }
+          : { url: result.releaseUrl, label: 'Open release page' }
+    : null
+  const secondaryDownload = result?.status === 'update_available' && primaryDownload
+    ? result.runningPortable && result.installerUrl && primaryDownload.url !== result.installerUrl
+      ? { url: result.installerUrl, label: 'Download installer (.exe)' }
+      : !result.runningPortable && result.portableUrl && primaryDownload.url !== result.portableUrl
+        ? { url: result.portableUrl, label: 'Download portable (.exe)' }
+        : null
+    : null
+
+  return <SettingsSection title="Updates" description="Check GitHub Releases on demand. TempoAI never checks for updates in the background.">
+    <SettingRow title="Current version" description={`v${currentVersion}`} value={
+      <Button type="button" variant="outline" disabled={check.isPending} onClick={() => { open.reset(); check.mutate() }}>
+        <RefreshCw className={check.isPending ? 'spin' : undefined} aria-hidden="true" />
+        {t(check.isPending ? 'Checking for updates…' : 'Check for updates')}
+      </Button>
+    } />
+    {(check.isPending || check.isError || result) && <div className="update-panel">
+      {check.isPending && <p role="status" className="update-status">{t('Checking GitHub Releases…')}</p>}
+      {!check.isPending && check.isError && <p key={checkedAt?.count} role="alert" className="form-error action-feedback">
+        {t('Checked at {time}: {reason}', {
+          time: checkedTime ?? '',
+          reason: t(typeof check.error === 'string' ? check.error : 'Could not check for updates. Check your connection and try again.'),
+        })}
+      </p>}
+      {!check.isPending && result?.status === 'up_to_date' && <p key={checkedAt?.count} role="status" className="update-status action-feedback">
+        {t('Checked at {time}: TempoAI {version} is up to date.', { time: checkedTime ?? '', version: `v${result.currentVersion}` })}
+      </p>}
+      {!check.isPending && result?.status === 'no_release' && <p key={checkedAt?.count} role="status" className="update-status action-feedback">
+        {t('Checked at {time}: no published release found on GitHub yet.', { time: checkedTime ?? '' })}
+      </p>}
+      {!check.isPending && result?.status === 'update_available' && primaryDownload && <div key={checkedAt?.count} className="update-banner">
+        <div className="update-banner-head">
+          <strong>{t('Version {version} available', { version: `v${result.latestVersion ?? ''}` })}</strong>
+          {result.publishedAt && <span>{t('Published {date}', { date: formatDay(result.publishedAt, language) })}</span>}
+        </div>
+        {result.notes && <p className="update-notes">{result.notes}</p>}
+        <div className="update-actions">
+          <Button type="button" disabled={open.isPending} onClick={() => open.mutate(primaryDownload.url)}>
+            <Download aria-hidden="true" />
+            {t(primaryDownload.label)}
+          </Button>
+          {secondaryDownload && <Button type="button" variant="outline" disabled={open.isPending} onClick={() => open.mutate(secondaryDownload.url)}>
+            <Download aria-hidden="true" />
+            {t(secondaryDownload.label)}
+          </Button>}
+          {primaryDownload.url !== result.releaseUrl && <Button type="button" variant="ghost" disabled={open.isPending} onClick={() => open.mutate(result.releaseUrl)}>
+            <ExternalLink aria-hidden="true" />
+            {t('View on GitHub')}
+          </Button>}
+        </div>
+        {open.isError && <p role="alert" className="form-error">
+          {t(typeof open.error === 'string' ? open.error : 'Could not open the download link in your browser.')}
+        </p>}
+      </div>}
+    </div>}
+  </SettingsSection>
 }
 
 function TextField({ name, label, value, placeholder, error, hideLabel, onChange }: {

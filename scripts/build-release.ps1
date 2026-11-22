@@ -57,10 +57,31 @@ $release = Join-Path $root 'release'
 $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($release, [StringComparison]::OrdinalIgnoreCase) }
 if ($running) { throw "Close TempoAI (opened from release\) and run npm run release again. The new build is ready; only the copy to release\ is pending." }
 # Only files this script creates live here, so older versions never sit next to the new one.
-if (Test-Path $release) { Get-ChildItem "$release\*" -Include 'TempoAI-*.exe' -File | Remove-Item -Force }
+if (Test-Path $release) { Get-ChildItem "$release\*" -Include 'TempoAI-*.exe','SHA256SUMS.txt' -File | Remove-Item -Force }
 New-Item -ItemType Directory -Force $release | Out-Null
-Copy-Item $installer.FullName (Join-Path $release "TempoAI-$version-setup.exe")
-Copy-Item "$target\tempo-ai.exe" (Join-Path $release "TempoAI-$version-portable.exe")
+$setupPath = Join-Path $release "TempoAI-$version-setup.exe"
+$portablePath = Join-Path $release "TempoAI-$version-portable.exe"
+Copy-Item $installer.FullName $setupPath
+Copy-Item "$target\tempo-ai.exe" $portablePath
+
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+  $checksumLines = Get-ChildItem $release -Filter 'TempoAI-*.exe' | Sort-Object Name | ForEach-Object {
+    $stream = [System.IO.File]::OpenRead($_.FullName)
+    try {
+      $hash = ([System.BitConverter]::ToString($sha256.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+    } finally {
+      $stream.Dispose()
+    }
+    "$hash *$($_.Name)"
+  }
+} finally {
+  $sha256.Dispose()
+}
+$checksumPath = Join-Path $release 'SHA256SUMS.txt'
+Set-Content -Path $checksumPath -Value $checksumLines -Encoding ascii
 
 Write-Host "`nReady in release\:" -ForegroundColor Green
-Get-ChildItem $release -Filter 'TempoAI-*.exe' | ForEach-Object { '  {0}  ({1:N1} MB)' -f $_.Name, ($_.Length / 1MB) }
+Get-ChildItem $release -Filter 'TempoAI-*.exe' | Sort-Object Name | ForEach-Object { '  {0}  ({1:N1} MB)' -f $_.Name, ($_.Length / 1MB) }
+Write-Host "  SHA256SUMS.txt" -ForegroundColor Gray
+$checksumLines | ForEach-Object { "  $_" }

@@ -1,5 +1,5 @@
 use crate::{
-    core::preferences::is_local_path,
+    core::preferences::{is_local_path, resolve_local_dir, resolve_local_file},
     providers::{self, Observation, Sessions, HISTORY_SECONDS},
 };
 use chrono::DateTime;
@@ -7,24 +7,31 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 const MAX_JSONL_FILES: usize = 2_500;
+const MAX_SCANNED_ENTRIES: usize = 10_000;
+const MAX_FILES_PARSED_PER_ROUND: usize = 250;
+const MAX_PARSE_BYTES_PER_ROUND: u64 = 32 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOKEN_VALUE: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Default)]
 pub struct ParsedClaudeFile {
+    cutoff: i64,
+    byte_offset: u64,
+    line_count: usize,
     session_id: Option<String>,
     project_name: Option<String>,
     git_branch: Option<String>,
     model: Option<String>,
     started_at: Option<i64>,
     last_activity_at: Option<i64>,
+    requests: HashMap<String, (u64, u64, u64, u64)>,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -33,14 +40,51 @@ pub struct ParsedClaudeFile {
     has_usage: bool,
 }
 
+impl ParsedClaudeFile {
+    fn recompute_totals(&mut self) {
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.cache_read_tokens = 0;
+        self.cache_creation_tokens = 0;
+        self.request_count = self.requests.len() as u64;
+        self.has_usage = !self.requests.is_empty();
+        for &(input, output, cache_read, cache_create) in self.requests.values() {
+            self.input_tokens = self.input_tokens.saturating_add(input);
+            self.output_tokens = self.output_tokens.saturating_add(output);
+            self.cache_read_tokens = self.cache_read_tokens.saturating_add(cache_read);
+            self.cache_creation_tokens = self.cache_creation_tokens.saturating_add(cache_create);
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ParsedCodexFile {
+    cutoff: i64,
+    byte_offset: u64,
+    line_count: usize,
     session_id: Option<String>,
     project_name: Option<String>,
     git_branch: Option<String>,
     model: Option<String>,
     started_at: Option<i64>,
     last_activity_at: Option<i64>,
+    base_input: u64,
+    base_cache_read: u64,
+    base_output: u64,
+    base_total: u64,
+    base_reqs: u64,
+    max_cumulative_total: u64,
+    cumulative_found: bool,
+    cum_input: u64,
+    cum_cache_read: u64,
+    cum_output: u64,
+    cum_total: u64,
+    cum_reqs: u64,
+    fallback_input: u64,
+    fallback_cache_read: u64,
+    fallback_output: u64,
+    fallback_total: u64,
+    fallback_reqs: u64,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -48,6 +92,33 @@ pub struct ParsedCodexFile {
     request_count: u64,
     has_usage: bool,
     rate_limits: Option<(i64, Option<String>, Value)>,
+}
+
+impl ParsedCodexFile {
+    fn recompute_totals(&mut self) {
+        if self.cumulative_found && self.cum_total > self.base_total {
+            self.input_tokens = self.cum_input.saturating_sub(self.base_input);
+            self.cache_read_tokens = self.cum_cache_read.saturating_sub(self.base_cache_read);
+            self.output_tokens = self.cum_output.saturating_sub(self.base_output);
+            self.total_tokens = self.cum_total.saturating_sub(self.base_total);
+            self.request_count = self.cum_reqs.saturating_sub(self.base_reqs).max(1);
+            self.has_usage = true;
+        } else if !self.cumulative_found && self.fallback_total > 0 {
+            self.input_tokens = self.fallback_input;
+            self.cache_read_tokens = self.fallback_cache_read;
+            self.output_tokens = self.fallback_output;
+            self.total_tokens = self.fallback_total;
+            self.request_count = self.fallback_reqs;
+            self.has_usage = true;
+        } else {
+            self.input_tokens = 0;
+            self.cache_read_tokens = 0;
+            self.output_tokens = 0;
+            self.total_tokens = 0;
+            self.request_count = 0;
+            self.has_usage = false;
+        }
+    }
 }
 
 pub type ClaudeLogCache = HashMap<PathBuf, (SystemTime, u64, ParsedClaudeFile)>;
@@ -78,10 +149,10 @@ pub fn codex_sessions_dir() -> Option<PathBuf> {
 }
 
 pub fn has_jsonl_files(root: &Path, max_depth: usize) -> bool {
-    if !is_local_path(root) {
+    let Some(resolved_root) = resolve_local_dir(root) else {
         return false;
-    }
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    };
+    let mut stack = vec![(resolved_root.clone(), 0usize)];
     let mut inspected = 0usize;
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else { continue };
@@ -92,7 +163,10 @@ pub fn has_jsonl_files(root: &Path, max_depth: usize) -> bool {
             }
             let Ok(kind) = entry.file_type() else { continue };
             let path = entry.path();
-            if kind.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
+            if kind.is_file()
+                && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                && resolve_local_file(&path).is_some_and(|resolved| resolved.starts_with(&resolved_root))
+            {
                 return true;
             }
             if kind.is_dir() && depth < max_depth {
@@ -103,20 +177,23 @@ pub fn has_jsonl_files(root: &Path, max_depth: usize) -> bool {
     false
 }
 
-fn collect_jsonl_files(root: &Path, max_depth: usize, cutoff: SystemTime) -> Vec<(SystemTime, PathBuf, u64)> {
-    if !is_local_path(root) {
-        return Vec::new();
-    }
+fn collect_jsonl_files(resolved_root: &Path, max_depth: usize, cutoff: SystemTime) -> Vec<(SystemTime, PathBuf, u64)> {
     let mut files = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut stack = vec![(resolved_root.to_path_buf(), 0usize)];
     let mut visited_dirs = 0usize;
+    let mut scanned_entries = 0usize;
     while let Some((dir, depth)) = stack.pop() {
-        if visited_dirs >= 2_000 {
+        if visited_dirs >= 2_000 || scanned_entries >= MAX_SCANNED_ENTRIES {
             break;
         }
         visited_dirs += 1;
         let Ok(entries) = fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
+            scanned_entries += 1;
+            if scanned_entries > MAX_SCANNED_ENTRIES {
+                break;
+            }
+            // DirEntry::file_type does not follow symlinks or directory junctions.
             let Ok(kind) = entry.file_type() else { continue };
             let path = entry.path();
             if kind.is_dir() && depth < max_depth {
@@ -160,30 +237,43 @@ fn capped_u64(value: &Value) -> u64 {
     value.as_u64().filter(|n| *n <= MAX_TOKEN_VALUE).unwrap_or(0)
 }
 
-/// Reads lines bounded to MAX_LINE_BYTES; oversized lines are drained safely without allocation spikes.
-fn for_each_line<F>(path: &Path, mut visit: F) -> std::io::Result<()>
+/// Streams lines from `start_offset` bounded to MAX_LINE_BYTES without stopping on blank lines.
+/// Returns the byte offset after the last newline-terminated line and the line count for incremental resumes.
+fn for_each_line_from<F>(path: &Path, start_offset: u64, start_line: usize, mut visit: F) -> std::io::Result<(u64, usize)>
 where
     F: FnMut(usize, &[u8]),
 {
-    let file = fs::File::open(path)?;
+    let mut file = fs::File::open(path)?;
+    if start_offset > 0 {
+        file.seek(SeekFrom::Start(start_offset))?;
+    }
     let mut reader = BufReader::with_capacity(32 * 1024, file);
     let mut buffer = Vec::with_capacity(8 * 1024);
-    let mut line_index = 0usize;
+    let mut line_index = start_line;
+    let mut consumed = start_offset;
+    let mut safe_offset = start_offset;
+    let mut safe_line_count = start_line;
     loop {
         buffer.clear();
         let mut oversized = false;
+        let mut saw_any = false;
+        let mut ended_with_newline = false;
         loop {
             let chunk = reader.fill_buf()?;
             if chunk.is_empty() {
                 break;
             }
+            saw_any = true;
             if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
                 if !oversized && buffer.len() + pos <= MAX_LINE_BYTES {
                     buffer.extend_from_slice(&chunk[..pos]);
                 } else {
                     oversized = true;
                 }
-                reader.consume(pos + 1);
+                let advance = pos + 1;
+                reader.consume(advance);
+                consumed = consumed.saturating_add(advance as u64);
+                ended_with_newline = true;
                 break;
             }
             let len = chunk.len();
@@ -193,8 +283,9 @@ where
                 oversized = true;
             }
             reader.consume(len);
+            consumed = consumed.saturating_add(len as u64);
         }
-        if buffer.is_empty() && !oversized {
+        if !saw_any {
             break;
         }
         if !oversized {
@@ -206,24 +297,21 @@ where
             }
         }
         line_index += 1;
+        if ended_with_newline {
+            safe_offset = consumed;
+            safe_line_count = line_index;
+        }
     }
-    Ok(())
+    Ok((safe_offset, safe_line_count))
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-fn parse_claude_file(path: &Path, fallback_id: Option<String>, fallback_project: Option<String>) -> ParsedClaudeFile {
-    let mut parsed = ParsedClaudeFile {
-        session_id: fallback_id,
-        project_name: fallback_project,
-        ..ParsedClaudeFile::default()
-    };
+fn parse_claude_into(parsed: &mut ParsedClaudeFile, path: &Path, cutoff: i64) {
     // Claude Code can emit multiple streaming chunks sharing one message.id; keep the latest/highest output per id.
-    let mut requests: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
-
-    let _ = for_each_line(path, |index, line| {
+    let result = for_each_line_from(path, parsed.byte_offset, parsed.line_count, |index, line| {
         let should_parse = index < 4
             || line.len() <= 4_096
             || contains_bytes(line, b"\"usage\"")
@@ -243,13 +331,18 @@ fn parse_claude_file(path: &Path, fallback_id: Option<String>, fallback_project:
         if let Some(branch) = safe_text(&entry["gitBranch"], 120) {
             parsed.git_branch = Some(branch);
         }
-        if let Some(ts) = parse_timestamp(&entry["timestamp"]) {
-            parsed.started_at = Some(parsed.started_at.map_or(ts, |prev| prev.min(ts)));
-            parsed.last_activity_at = Some(parsed.last_activity_at.map_or(ts, |prev| prev.max(ts)));
-        }
         let message = &entry["message"];
         if let Some(model) = safe_text(&message["model"], 120).filter(|m| !m.starts_with('<')) {
             parsed.model = Some(model);
+        }
+        let ts = parse_timestamp(&entry["timestamp"]);
+        // After a manual history clear, ignore activity and tokens recorded at or before the cutoff.
+        if cutoff > 0 && ts.is_none_or(|t| t <= cutoff) {
+            return;
+        }
+        if let Some(ts) = ts {
+            parsed.started_at = Some(parsed.started_at.map_or(ts, |prev| prev.min(ts)));
+            parsed.last_activity_at = Some(parsed.last_activity_at.map_or(ts, |prev| prev.max(ts)));
         }
         let usage = &message["usage"];
         if usage.is_object() {
@@ -261,51 +354,81 @@ fn parse_claude_file(path: &Path, fallback_id: Option<String>, fallback_project:
                 let key = safe_text(&message["id"], 120)
                     .or_else(|| safe_text(&entry["requestId"], 120))
                     .unwrap_or_else(|| format!("line:{index}"));
-                let replace = requests
+                let replace = parsed.requests
                     .get(&key)
                     .is_none_or(|prev| output >= prev.1 && (input + output + cache_read + cache_create) >= (prev.0 + prev.1 + prev.2 + prev.3));
                 if replace {
-                    requests.insert(key, (input, output, cache_read, cache_create));
+                    parsed.requests.insert(key, (input, output, cache_read, cache_create));
                 }
             }
         }
     });
-
-    if !requests.is_empty() {
-        parsed.has_usage = true;
-        parsed.request_count = requests.len() as u64;
-        for (input, output, cache_read, cache_create) in requests.into_values() {
-            parsed.input_tokens = parsed.input_tokens.saturating_add(input);
-            parsed.output_tokens = parsed.output_tokens.saturating_add(output);
-            parsed.cache_read_tokens = parsed.cache_read_tokens.saturating_add(cache_read);
-            parsed.cache_creation_tokens = parsed.cache_creation_tokens.saturating_add(cache_create);
-        }
+    if let Ok((offset, line_count)) = result {
+        parsed.byte_offset = offset;
+        parsed.line_count = line_count;
     }
-    parsed
+    parsed.cutoff = cutoff;
+    parsed.recompute_totals();
 }
 
-pub fn read_claude_sessions(root: &Path, now: i64, cache: &mut ClaudeLogCache) -> Sessions {
+pub fn read_claude_sessions(root: &Path, now: i64, clear_cutoff: i64, cache: &mut ClaudeLogCache) -> Sessions {
+    let Some(resolved_root) = resolve_local_dir(root) else {
+        return Vec::new();
+    };
     let cutoff_epoch = now.saturating_sub(HISTORY_SECONDS).max(0);
-    let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff_epoch as u64);
-    let candidates = collect_jsonl_files(root, 4, cutoff);
+    let cutoff_time = SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff_epoch as u64);
+    let candidates = collect_jsonl_files(&resolved_root, 4, cutoff_time);
     let mut next_cache = ClaudeLogCache::new();
     let mut merged: HashMap<String, ParsedClaudeFile> = HashMap::new();
+    let mut files_parsed = 0usize;
+    let mut bytes_parsed = 0u64;
 
     for (modified, file, length) in candidates {
-        let parsed = match cache.remove(&file) {
-            Some((time, size, existing)) if time == modified && size == length => existing,
+        let Some(resolved_file) = resolve_local_file(&file).filter(|p| p.starts_with(&resolved_root)) else {
+            continue;
+        };
+        let cached = cache.remove(&resolved_file);
+        let parsed = match cached {
+            Some((time, size, existing)) if time == modified && size == length && existing.cutoff == clear_cutoff => existing,
+            Some((time, size, mut existing)) if existing.cutoff == clear_cutoff && length >= existing.byte_offset => {
+                let delta = length.saturating_sub(existing.byte_offset);
+                if files_parsed < MAX_FILES_PARSED_PER_ROUND && bytes_parsed.saturating_add(delta) <= MAX_PARSE_BYTES_PER_ROUND {
+                    parse_claude_into(&mut existing, &resolved_file, clear_cutoff);
+                    files_parsed += 1;
+                    bytes_parsed = bytes_parsed.saturating_add(delta);
+                    existing
+                } else {
+                    // Keep the previous parsed snapshot for this round and catch up on the next tick.
+                    next_cache.insert(resolved_file, (time, size, existing));
+                    continue;
+                }
+            }
             _ => {
-                let stem = file
+                if files_parsed >= MAX_FILES_PARSED_PER_ROUND || (files_parsed > 0 && bytes_parsed.saturating_add(length) > MAX_PARSE_BYTES_PER_ROUND) {
+                    continue;
+                }
+                let stem = resolved_file
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty() && s.len() <= 120 && !s.chars().any(char::is_control))
                     .map(str::to_owned);
-                parse_claude_file(&file, stem, None)
+                let mut fresh = ParsedClaudeFile {
+                    cutoff: clear_cutoff,
+                    session_id: stem,
+                    ..ParsedClaudeFile::default()
+                };
+                parse_claude_into(&mut fresh, &resolved_file, clear_cutoff);
+                files_parsed += 1;
+                bytes_parsed = bytes_parsed.saturating_add(length);
+                fresh
             }
         };
-        let (_, _, entry) = next_cache.entry(file).or_insert((modified, length, parsed));
+        next_cache.insert(resolved_file, (modified, length, parsed));
+    }
+
+    for (_, _, entry) in next_cache.values() {
         let Some(id) = entry.session_id.clone() else { continue };
-        let Some(last) = entry.last_activity_at.filter(|ts| *ts <= now + 300 && *ts >= cutoff_epoch) else { continue };
+        let Some(last) = entry.last_activity_at.filter(|ts| *ts <= now + 300 && *ts >= cutoff_epoch && *ts > clear_cutoff) else { continue };
         let slot = merged.entry(id.clone()).or_insert_with(|| ParsedClaudeFile {
             session_id: Some(id),
             ..ParsedClaudeFile::default()
@@ -383,19 +506,8 @@ pub fn read_claude_sessions(root: &Path, now: i64, cache: &mut ClaudeLogCache) -
     sessions
 }
 
-fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile {
-    let mut parsed = ParsedCodexFile {
-        session_id: fallback_id,
-        ..ParsedCodexFile::default()
-    };
-    let mut max_cumulative_total = 0u64;
-    let mut cumulative_found = false;
-    let mut fallback_input = 0u64;
-    let mut fallback_output = 0u64;
-    let mut fallback_cache_read = 0u64;
-    let mut fallback_total = 0u64;
-
-    let _ = for_each_line(path, |_, line| {
+fn parse_codex_into(parsed: &mut ParsedCodexFile, path: &Path, cutoff: i64) {
+    let result = for_each_line_from(path, parsed.byte_offset, parsed.line_count, |_, line| {
         let interesting = contains_bytes(line, b"session_meta")
             || contains_bytes(line, b"turn_context")
             || contains_bytes(line, b"token_count");
@@ -404,9 +516,12 @@ fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile
         }
         let Ok(entry) = serde_json::from_slice::<Value>(line) else { return };
         let ts = parse_timestamp(&entry["timestamp"]);
-        if let Some(ts) = ts {
-            parsed.started_at = Some(parsed.started_at.map_or(ts, |prev| prev.min(ts)));
-            parsed.last_activity_at = Some(parsed.last_activity_at.map_or(ts, |prev| prev.max(ts)));
+        let after_cutoff = cutoff <= 0 || ts.is_some_and(|t| t > cutoff);
+        if after_cutoff {
+            if let Some(ts) = ts {
+                parsed.started_at = Some(parsed.started_at.map_or(ts, |prev| prev.min(ts)));
+                parsed.last_activity_at = Some(parsed.last_activity_at.map_or(ts, |prev| prev.max(ts)));
+            }
         }
         let kind = entry["type"].as_str().unwrap_or("");
         let payload = &entry["payload"];
@@ -421,8 +536,10 @@ fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile
                 if let Some(branch) = safe_text(&payload["git"]["branch"], 120) {
                     parsed.git_branch = Some(branch);
                 }
-                if let Some(start) = parse_timestamp(&payload["timestamp"]) {
-                    parsed.started_at = Some(parsed.started_at.map_or(start, |prev| prev.min(start)));
+                if after_cutoff {
+                    if let Some(start) = parse_timestamp(&payload["timestamp"]) {
+                        parsed.started_at = Some(parsed.started_at.map_or(start, |prev| prev.min(start)));
+                    }
                 }
             }
             "turn_context" => {
@@ -444,18 +561,25 @@ fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile
                         .max(capped_u64(&usage["cache_read_input_tokens"]));
                     let output = capped_u64(&usage["output_tokens"]);
                     let total = capped_u64(&usage["total_tokens"]).max(raw_input.saturating_add(output));
-                    if total > max_cumulative_total {
-                        cumulative_found = true;
-                        max_cumulative_total = total;
-                        // OpenAI input_tokens includes cached_input_tokens; separate them so pricing matches Claude's schema.
-                        parsed.input_tokens = raw_input.saturating_sub(cache_read);
-                        parsed.cache_read_tokens = cache_read;
-                        parsed.output_tokens = output;
-                        parsed.total_tokens = total;
-                        parsed.has_usage = true;
-                        parsed.request_count = parsed.request_count.saturating_add(1);
+                    // OpenAI input_tokens includes cached_input_tokens; separate them so pricing matches Claude's schema.
+                    let net_input = raw_input.saturating_sub(cache_read);
+                    if total > parsed.max_cumulative_total {
+                        parsed.cumulative_found = true;
+                        parsed.max_cumulative_total = total;
+                        parsed.cum_reqs = parsed.cum_reqs.saturating_add(1);
+                        parsed.cum_input = net_input;
+                        parsed.cum_cache_read = cache_read;
+                        parsed.cum_output = output;
+                        parsed.cum_total = total;
+                        if !after_cutoff {
+                            parsed.base_input = net_input;
+                            parsed.base_cache_read = cache_read;
+                            parsed.base_output = output;
+                            parsed.base_total = total;
+                            parsed.base_reqs = parsed.cum_reqs;
+                        }
                     }
-                } else if !cumulative_found && info["last_token_usage"].is_object() {
+                } else if !parsed.cumulative_found && after_cutoff && info["last_token_usage"].is_object() {
                     let usage = &info["last_token_usage"];
                     let raw_input = capped_u64(&usage["input_tokens"]);
                     let cache_read = capped_u64(&usage["cached_input_tokens"])
@@ -463,12 +587,11 @@ fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile
                     let output = capped_u64(&usage["output_tokens"]);
                     let total = capped_u64(&usage["total_tokens"]).max(raw_input.saturating_add(output));
                     if total > 0 {
-                        fallback_input = fallback_input.saturating_add(raw_input.saturating_sub(cache_read));
-                        fallback_cache_read = fallback_cache_read.saturating_add(cache_read);
-                        fallback_output = fallback_output.saturating_add(output);
-                        fallback_total = fallback_total.saturating_add(total);
-                        parsed.has_usage = true;
-                        parsed.request_count = parsed.request_count.saturating_add(1);
+                        parsed.fallback_input = parsed.fallback_input.saturating_add(raw_input.saturating_sub(cache_read));
+                        parsed.fallback_cache_read = parsed.fallback_cache_read.saturating_add(cache_read);
+                        parsed.fallback_output = parsed.fallback_output.saturating_add(output);
+                        parsed.fallback_total = parsed.fallback_total.saturating_add(total);
+                        parsed.fallback_reqs = parsed.fallback_reqs.saturating_add(1);
                     }
                 }
                 if payload["rate_limits"].is_object() {
@@ -484,14 +607,12 @@ fn parse_codex_file(path: &Path, fallback_id: Option<String>) -> ParsedCodexFile
             _ => {}
         }
     });
-
-    if !cumulative_found && fallback_total > 0 {
-        parsed.input_tokens = fallback_input;
-        parsed.cache_read_tokens = fallback_cache_read;
-        parsed.output_tokens = fallback_output;
-        parsed.total_tokens = fallback_total;
+    if let Ok((offset, line_count)) = result {
+        parsed.byte_offset = offset;
+        parsed.line_count = line_count;
     }
-    parsed
+    parsed.cutoff = cutoff;
+    parsed.recompute_totals();
 }
 
 fn codex_jsonl_quotas(rate_limits: &Value, at: i64, now: i64) -> Vec<Value> {
@@ -527,34 +648,69 @@ fn codex_jsonl_quotas(rate_limits: &Value, at: i64, now: i64) -> Vec<Value> {
     quotas
 }
 
-pub fn read_codex_sessions(root: &Path, now: i64, cache: &mut CodexLogCache) -> CodexLogResult {
+pub fn read_codex_sessions(root: &Path, now: i64, clear_cutoff: i64, cache: &mut CodexLogCache) -> CodexLogResult {
+    let Some(resolved_root) = resolve_local_dir(root) else {
+        return CodexLogResult { sessions: Vec::new(), latest_observation: None };
+    };
     let cutoff_epoch = now.saturating_sub(HISTORY_SECONDS).max(0);
-    let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff_epoch as u64);
-    let candidates = collect_jsonl_files(root, 5, cutoff);
+    let cutoff_time = SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff_epoch as u64);
+    let candidates = collect_jsonl_files(&resolved_root, 5, cutoff_time);
     let mut next_cache = CodexLogCache::new();
     let mut sessions = Vec::new();
     let mut latest_limits: Option<(i64, Option<String>, Value)> = None;
+    let mut files_parsed = 0usize;
+    let mut bytes_parsed = 0u64;
 
     for (modified, file, length) in candidates {
-        let parsed = match cache.remove(&file) {
-            Some((time, size, existing)) if time == modified && size == length => existing,
+        let Some(resolved_file) = resolve_local_file(&file).filter(|p| p.starts_with(&resolved_root)) else {
+            continue;
+        };
+        let cached = cache.remove(&resolved_file);
+        let parsed = match cached {
+            Some((time, size, existing)) if time == modified && size == length && existing.cutoff == clear_cutoff => existing,
+            Some((time, size, mut existing)) if existing.cutoff == clear_cutoff && length >= existing.byte_offset => {
+                let delta = length.saturating_sub(existing.byte_offset);
+                if files_parsed < MAX_FILES_PARSED_PER_ROUND && bytes_parsed.saturating_add(delta) <= MAX_PARSE_BYTES_PER_ROUND {
+                    parse_codex_into(&mut existing, &resolved_file, clear_cutoff);
+                    files_parsed += 1;
+                    bytes_parsed = bytes_parsed.saturating_add(delta);
+                    existing
+                } else {
+                    next_cache.insert(resolved_file, (time, size, existing));
+                    continue;
+                }
+            }
             _ => {
-                let stem = file
+                if files_parsed >= MAX_FILES_PARSED_PER_ROUND || (files_parsed > 0 && bytes_parsed.saturating_add(length) > MAX_PARSE_BYTES_PER_ROUND) {
+                    continue;
+                }
+                let stem = resolved_file
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .filter(|s| !s.is_empty() && s.len() <= 120 && !s.chars().any(char::is_control))
                     .map(str::to_owned);
-                parse_codex_file(&file, stem)
+                let mut fresh = ParsedCodexFile {
+                    cutoff: clear_cutoff,
+                    session_id: stem,
+                    ..ParsedCodexFile::default()
+                };
+                parse_codex_into(&mut fresh, &resolved_file, clear_cutoff);
+                files_parsed += 1;
+                bytes_parsed = bytes_parsed.saturating_add(length);
+                fresh
             }
         };
-        let (_, _, entry) = next_cache.entry(file).or_insert((modified, length, parsed));
+        next_cache.insert(resolved_file, (modified, length, parsed));
+    }
+
+    for (_, _, entry) in next_cache.values() {
         if let Some((at, plan, limits)) = &entry.rate_limits {
             if *at <= now + 300 && *at >= cutoff_epoch && latest_limits.as_ref().is_none_or(|(prev, _, _)| at > prev) {
                 latest_limits = Some((*at, plan.clone(), limits.clone()));
             }
         }
         let Some(id) = entry.session_id.as_deref() else { continue };
-        let Some(last) = entry.last_activity_at.filter(|ts| *ts <= now + 300 && *ts >= cutoff_epoch) else { continue };
+        let Some(last) = entry.last_activity_at.filter(|ts| *ts <= now + 300 && *ts >= cutoff_epoch && *ts > clear_cutoff) else { continue };
         let last_clamped = last.min(now);
         let Some(last_iso) = providers::iso(last_clamped) else { continue };
         let Some(updated_iso) = providers::iso(now) else { continue };
@@ -638,7 +794,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn claude_jsonl_deduplicates_streaming_messages_and_ignores_conversation_text() {
+    fn claude_jsonl_deduplicates_streaming_messages_ignores_blank_lines_and_discards_text() {
         let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let project = dir.path().join("C--work-tempo-ai");
         fs::create_dir_all(&project).unwrap();
@@ -653,6 +809,8 @@ mod tests {
             json!({"type":"user","sessionId":"sess-1","cwd":"C:\\work\\tempo-ai","gitBranch":"feat/zero","timestamp":t1,"message":{"content":"SECRET PROMPT NEVER STORED"}})
         )
         .unwrap();
+        // Blank LF and CRLF lines mid-file must not stop parsing subsequent records.
+        handle.write_all(b"\n\r\n").unwrap();
         writeln!(
             handle,
             "{}",
@@ -665,6 +823,7 @@ mod tests {
             json!({"type":"assistant","sessionId":"sess-1","cwd":"C:\\work\\tempo-ai","gitBranch":"feat/zero","timestamp":t2,"message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100,"output_tokens":80,"cache_read_input_tokens":500,"cache_creation_input_tokens":50}}})
         )
         .unwrap();
+        handle.write_all(b"\n").unwrap();
         writeln!(
             handle,
             "{}",
@@ -673,7 +832,7 @@ mod tests {
         .unwrap();
 
         let mut cache = ClaudeLogCache::new();
-        let sessions = read_claude_sessions(dir.path(), now, &mut cache);
+        let sessions = read_claude_sessions(dir.path(), now, 0, &mut cache);
         assert_eq!(sessions.len(), 1);
         let row = &sessions[0].1;
         assert_eq!(row["id"], "claude:sess-1");
@@ -689,6 +848,63 @@ mod tests {
         assert_eq!(row["requestCount"], 2);
         assert!(!row.to_string().contains("SECRET PROMPT"));
         assert!(!row.to_string().contains("secret reply"));
+
+        // Incremental tail append adds only new records without re-parsing from byte 0.
+        let t3 = providers::iso(now - 10).unwrap();
+        let mut append = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            append,
+            "{}",
+            json!({"type":"assistant","sessionId":"sess-1","timestamp":t3,"message":{"id":"msg_3","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})
+        )
+        .unwrap();
+        drop(append);
+        let updated = read_claude_sessions(dir.path(), now, 0, &mut cache);
+        assert_eq!(updated[0].1["totalTokens"], 2030);
+        assert_eq!(updated[0].1["requestCount"], 3);
+    }
+
+    #[test]
+    fn clear_cutoff_excludes_pre_clear_tokens_even_when_old_sessions_resume() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 60;
+        let before = providers::iso(now - 120).unwrap();
+        let after = providers::iso(now - 20).unwrap();
+
+        let claude_dir = dir.path().join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let claude_file = claude_dir.join("sess-resumed.jsonl");
+        let mut cf = fs::File::create(&claude_file).unwrap();
+        writeln!(cf, "{}", json!({"type":"assistant","sessionId":"sess-resumed","cwd":"C:\\work\\app","timestamp":before,"message":{"id":"old_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":5000,"output_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})).unwrap();
+        writeln!(cf, "{}", json!({"type":"assistant","sessionId":"sess-resumed","cwd":"C:\\work\\app","timestamp":after,"message":{"id":"new_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}})).unwrap();
+
+        let mut c_cache = ClaudeLogCache::new();
+        let claude_sessions = read_claude_sessions(&claude_dir, now, cutoff, &mut c_cache);
+        assert_eq!(claude_sessions.len(), 1);
+        assert_eq!(claude_sessions[0].1["inputTokens"], 100);
+        assert_eq!(claude_sessions[0].1["outputTokens"], 50);
+        assert_eq!(claude_sessions[0].1["totalTokens"], 150);
+        assert_eq!(claude_sessions[0].1["requestCount"], 1);
+
+        let codex_dir = dir.path().join("codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let codex_file = codex_dir.join("rollout-resumed.jsonl");
+        let mut xf = fs::File::create(&codex_file).unwrap();
+        writeln!(xf, "{}", json!({"timestamp":before,"type":"session_meta","payload":{"id":"thread-resumed","cwd":"C:\\work\\api","timestamp":before,"git":{"branch":"main"}}})).unwrap();
+        writeln!(xf, "{}", json!({"timestamp":before,"type":"turn_context","payload":{"model":"gpt-5.3-codex"}})).unwrap();
+        writeln!(xf, "{}", json!({"timestamp":before,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cached_input_tokens":2000,"output_tokens":500,"total_tokens":5500}}}})).unwrap();
+        writeln!(xf, "{}", json!({"timestamp":after,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5400,"cached_input_tokens":2200,"output_tokens":600,"total_tokens":6000}}}})).unwrap();
+
+        let mut x_cache = CodexLogCache::new();
+        let codex_res = read_codex_sessions(&codex_dir, now, cutoff, &mut x_cache);
+        assert_eq!(codex_res.sessions.len(), 1);
+        let row = &codex_res.sessions[0].1;
+        assert_eq!(row["inputTokens"], 200);
+        assert_eq!(row["cacheReadTokens"], 200);
+        assert_eq!(row["outputTokens"], 100);
+        assert_eq!(row["totalTokens"], 500);
+        assert_eq!(row["requestCount"], 1);
     }
 
     #[test]
@@ -719,6 +935,7 @@ mod tests {
             json!({"timestamp":t1,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":200,"total_tokens":1200}},"rate_limits":null}})
         )
         .unwrap();
+        handle.write_all(b"\n").unwrap();
         writeln!(
             handle,
             "{}",
@@ -727,7 +944,7 @@ mod tests {
         .unwrap();
 
         let mut cache = CodexLogCache::new();
-        let result = read_codex_sessions(dir.path(), now, &mut cache);
+        let result = read_codex_sessions(dir.path(), now, 0, &mut cache);
         assert_eq!(result.sessions.len(), 1);
         let row = &result.sessions[0].1;
         assert_eq!(row["id"], "codex:thread-42");
@@ -744,5 +961,51 @@ mod tests {
         assert_eq!(obs.quotas.len(), 2);
         assert_eq!(obs.quotas[0]["usedPercent"], 34.5);
         assert_eq!(obs.quotas[1]["usedPercent"], 62.0);
+    }
+
+    #[test]
+    fn large_history_bounds_work_per_round_and_skips_directory_junctions() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let root = dir.path().join("projects");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let ts = providers::iso(now - 30).unwrap();
+
+        // Create 260 synthetic files (> MAX_FILES_PARSED_PER_ROUND) to verify bounded work and catch-up.
+        for i in 0..260 {
+            let f = root.join(format!("s-{i:03}.jsonl"));
+            fs::write(
+                &f,
+                format!("{}\n", json!({"type":"assistant","sessionId":format!("s-{i:03}"),"timestamp":ts,"message":{"id":"m","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":10,"output_tokens":5}}})),
+            )
+            .unwrap();
+        }
+        fs::write(
+            outside.join("escaped.jsonl"),
+            format!("{}\n", json!({"type":"assistant","sessionId":"escaped","timestamp":ts,"message":{"id":"m","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":999,"output_tokens":1}}})),
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let junction = root.join("linked-outside");
+        #[cfg(windows)]
+        let junction_created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), outside.to_str().unwrap()])
+            .output()
+            .is_ok_and(|out| out.status.success());
+
+        let mut cache = ClaudeLogCache::new();
+        let round1 = read_claude_sessions(&root, now, 0, &mut cache);
+        assert_eq!(round1.len(), MAX_FILES_PARSED_PER_ROUND);
+        let round2 = read_claude_sessions(&root, now, 0, &mut cache);
+        assert_eq!(round2.len(), 260);
+        assert!(!round2.iter().any(|(_, row)| row["id"] == "claude:escaped"));
+
+        #[cfg(windows)]
+        if junction_created {
+            let _ = fs::remove_dir(&junction);
+        }
     }
 }

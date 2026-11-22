@@ -23,6 +23,15 @@ function escapeXml(text: string) {
     .replaceAll("'", '&apos;')
 }
 
+/** Escapes Markdown formatting and raw HTML delimiters so metadata always renders as literal text. */
+function escapeMarkdown(text: string) {
+  return text
+    .replace(/[\r\n\t]+/g, ' ')
+    .replaceAll('\\', '\\\\')
+    .replace(/([`*_{}[\]()#!<>|~])/g, '\\$1')
+    .replace(/^([+-])/, '\\$1')
+}
+
 export function buildShareStats(sessions: SessionRecord[], options: ShareOptions) {
   const tokens = sessions.reduce((sum, s) => sum + (s.totalTokens ?? 0), 0)
   const hasTokens = sessions.some((s) => s.totalTokens !== null)
@@ -122,7 +131,7 @@ export function buildShareMarkdown(sessions: SessionRecord[], options: ShareOpti
   const { language, t, period, hidePrivateNames } = options
   const stats = buildShareStats(sessions, options)
   const lines = [
-    `### TempoAI — ${stats.providerLabel} (${t('{count} days', { count: period })})`,
+    `### TempoAI — ${escapeMarkdown(stats.providerLabel)} (${t('{count} days', { count: period })})`,
     '',
     `- **${t('Sessions')}**: ${formatNumber(stats.sessionsCount, language)}`,
     `- **${t('Total tokens')}**: ${stats.tokens !== null ? formatNumber(stats.tokens, language) : t('Unavailable')}`,
@@ -134,11 +143,11 @@ export function buildShareMarkdown(sessions: SessionRecord[], options: ShareOpti
     for (const row of stats.models) {
       const tokens = row.tokens !== null ? `${formatCompact(row.tokens, language)} tokens` : `${row.sessions}`
       const cost = row.costUsd !== null ? ` (${formatUsd(row.costUsd, language)})` : ''
-      lines.push(`- ${row.name}: ${tokens}${cost}`)
+      lines.push(`- ${escapeMarkdown(row.name)}: ${tokens}${cost}`)
     }
   }
   if (!hidePrivateNames && stats.projects.length > 0) {
-    lines.push('', `**${t('Top projects')}**: ${stats.projects.map((p) => p.name).join(', ')}`)
+    lines.push('', `**${t('Top projects')}**: ${stats.projects.map((p) => escapeMarkdown(p.name)).join(', ')}`)
   }
   lines.push('', `_${t('Generated locally by TempoAI. Cost is an API-equivalent estimate, separate from subscription billing.')}_`)
   return lines.join('\n')

@@ -1,5 +1,5 @@
 use crate::{
-    core::preferences::{is_local_path, require_window, LocalProvider},
+    core::preferences::{is_local_path, is_trusted_executable_path, require_window, resolve_local_file, strip_windows_verbatim, LocalProvider},
     providers::{self, claude, jsonl},
 };
 use chrono::DateTime;
@@ -54,22 +54,17 @@ pub struct ScanResult {
 }
 
 fn safe_path(path: &Path) -> Option<String> {
-    let path = path.to_str()?;
-    #[cfg(windows)]
-    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-    is_local_path(Path::new(path)).then(|| path.to_owned())
+    strip_windows_verbatim(path)?.to_str().map(str::to_owned)
 }
 
 fn is_provider_file(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json")) && is_local_path(path)
 }
 
-fn resolved_local_file(path: &Path) -> Option<PathBuf> {
+fn resolved_json_file(path: &Path) -> Option<PathBuf> {
     if !is_provider_file(path) { return None; }
-    let resolved = fs::canonicalize(path).ok()?;
-    #[cfg(windows)]
-    let resolved = PathBuf::from(resolved.to_str()?.strip_prefix(r"\\?\")?);
-    is_local_path(&resolved).then_some(resolved)
+    let resolved = resolve_local_file(path)?;
+    is_provider_file(&resolved).then_some(resolved)
 }
 
 fn find_executable(roots: &[PathBuf], names: &[&str], extensions: &[&str]) -> Option<PathBuf> {
@@ -78,6 +73,12 @@ fn find_executable(roots: &[PathBuf], names: &[&str], extensions: &[&str]) -> Op
             extensions.iter().map(|ext| root.join(format!("{name}.{ext}")))
                 .find(|path| path.is_file())
         })
+    })
+}
+
+fn find_trusted_exe(roots: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
+    roots.iter().filter(|root| is_local_path(root)).find_map(|root| {
+        names.iter().find_map(|name| is_trusted_executable_path(&root.join(format!("{name}.exe"))))
     })
 }
 
@@ -105,11 +106,11 @@ fn scan_paths() -> Vec<PathBuf> {
 }
 
 pub fn antigravity_executable() -> Option<PathBuf> {
-    find_executable(&scan_paths(), &["agy"], &["exe"])
+    find_trusted_exe(&scan_paths(), &["agy"])
 }
 
 pub fn codex_executable() -> Option<PathBuf> {
-    find_executable(&scan_paths(), &["codex"], &["exe"])
+    find_trusted_exe(&scan_paths(), &["codex"])
 }
 
 fn discover(roots: &[PathBuf], signals: &LocalSignals) -> Vec<DetectedAgent> {
@@ -122,8 +123,8 @@ fn discover(roots: &[PathBuf], signals: &LocalSignals) -> Vec<DetectedAgent> {
         };
         if executable.is_none() && !credentials_found && !logs_found { return None; }
         let source_path = match agent.id {
-            "codex" => find_executable(roots, agent.names, &["exe"]).and_then(|path| safe_path(&path)),
-            "antigravity" => find_executable(roots, &["agy"], &["exe"]).and_then(|path| safe_path(&path)),
+            "codex" => find_trusted_exe(roots, agent.names).and_then(|path| safe_path(&path)),
+            "antigravity" => find_trusted_exe(roots, &["agy"]).and_then(|path| safe_path(&path)),
             _ => None,
         };
         Some(DetectedAgent { id: agent.id, executable, source_path, credentials_found, logs_found })
@@ -137,7 +138,7 @@ pub async fn scan_providers(_app: AppHandle, window: WebviewWindow) -> Result<Sc
         let signals = LocalSignals {
             claude_credentials: claude::has_credentials(),
             claude_logs: jsonl::claude_projects_dir().is_some_and(|dir| jsonl::has_jsonl_files(&dir, 4)),
-            codex_credentials: jsonl::codex_home_dir().is_some_and(|dir| dir.join("auth.json").is_file()),
+            codex_credentials: jsonl::codex_home_dir().is_some_and(|dir| resolve_local_file(&dir.join("auth.json")).is_some()),
             codex_logs: jsonl::codex_sessions_dir().is_some_and(|dir| jsonl::has_jsonl_files(&dir, 5)),
         };
         ScanResult {
@@ -208,7 +209,7 @@ pub fn check_source(source: &LocalProvider, now: i64) -> (&'static str, &'static
 fn read_usage(path: &Path, now: i64) -> Result<(i64, Vec<Value>), &'static str> {
     const INVALID: &str = "The usage file is invalid. Check the example format and timestamps.";
     const UNREADABLE: &str = "Could not read the local usage file. Check the saved path and access.";
-    let path = resolved_local_file(path).ok_or(UNREADABLE)?;
+    let path = resolved_json_file(path).ok_or(UNREADABLE)?;
     let metadata = fs::symlink_metadata(&path).map_err(|_| UNREADABLE)?;
     if !metadata.file_type().is_file() { return Err(UNREADABLE); }
     if metadata.len() > MAX_SOURCE_BYTES { return Err(INVALID); }

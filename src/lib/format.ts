@@ -10,6 +10,7 @@ function formats(language: Language) {
     date: new Intl.DateTimeFormat(language, { month: 'short', day: 'numeric' }),
     weekday: new Intl.DateTimeFormat(language, { weekday: 'short', hour: 'numeric', minute: '2-digit' }),
     time: new Intl.DateTimeFormat(language, { hour: 'numeric', minute: '2-digit' }),
+    timeSeconds: new Intl.DateTimeFormat(language, { hour: 'numeric', minute: '2-digit', second: '2-digit' }),
     time24: new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit', hour12: false }),
     dateTime: new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' }),
   }
@@ -27,6 +28,7 @@ export const formatUsd = (value: number | null, language: Language = 'en-US') =>
 }
 export const formatDay = (value: number | string, language: Language = 'en-US') => localeFormats[language].date.format(new Date(value))
 export const formatTime = (value: number | string, language: Language = 'en-US') => localeFormats[language].time.format(new Date(value))
+export const formatTimeWithSeconds = (value: number | string, language: Language = 'en-US') => localeFormats[language].timeSeconds.format(new Date(value))
 export const formatDateTime = (value: number | string, language: Language = 'en-US') => localeFormats[language].dateTime.format(new Date(value))
 export const formatReset = (value: number, weekly: boolean, language: Language = 'en-US') => localeFormats[language][weekly ? 'weekday' : 'time'].format(value)
 

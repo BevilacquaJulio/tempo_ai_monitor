@@ -61,3 +61,27 @@ it('builds deterministic SVG and Markdown while hiding private project names whe
   expect(md).toContain('claude-sonnet-4-5')
   expect(md).not.toContain('Secret')
 })
+
+it('escapes Markdown formatting and link syntax in model and project metadata', () => {
+  const injected: SessionRecord[] = [
+    {
+      ...sample[0],
+      projectName: '[click](https://evil.test) & ![img](https://evil.test/p.png)',
+      model: 'model_*[bad](https://evil.test)*\n## Heading',
+    },
+  ]
+  const md = buildShareMarkdown(injected, {
+    period: 7,
+    provider: '',
+    theme: 'dark',
+    hidePrivateNames: false,
+    language: 'en-US',
+    t: identity,
+  })
+  expect(md).not.toContain('[click](https://evil.test)')
+  expect(md).not.toContain('![img](https://evil.test/p.png)')
+  expect(md).not.toContain('\n## Heading')
+  expect(md).toContain('\\[click\\]\\(https://evil.test\\)')
+  expect(md).toContain('\\!\\[img\\]\\(https://evil.test/p.png\\)')
+  expect(md).toContain('model\\_\\*\\[bad\\]\\(https://evil.test\\)\\* \\#\\# Heading')
+})

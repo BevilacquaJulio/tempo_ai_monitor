@@ -1,4 +1,7 @@
-use crate::providers::{self, discovery};
+use crate::{
+    core::preferences::is_trusted_executable_path,
+    providers,
+};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::{collections::HashSet, io::Read, path::Path, process::{Command, Stdio}, sync::mpsc, time::{Duration, Instant}};
@@ -7,8 +10,8 @@ pub const ID: &str = "antigravity";
 const UPDATE_REQUIRED: &str = "Update Antigravity CLI to version 1.1.11 or newer to check usage here.";
 const COULD_NOT_READ: &str = "Could not check Antigravity usage. Check your Google sign-in in Antigravity and try again.";
 
-pub fn read() -> Result<Reading, &'static str> {
-    let executable = discovery::antigravity_executable().ok_or("Install Antigravity CLI to check usage here.")?;
+pub fn read(executable: &Path) -> Result<Reading, &'static str> {
+    let executable = is_trusted_executable_path(executable).ok_or("Could not find a trusted local Antigravity CLI executable.")?;
     let version = run(&executable, &["--version"], Duration::from_secs(5)).ok_or(UPDATE_REQUIRED)?;
     if !supports_usage(&String::from_utf8_lossy(&version)) { return Err(UPDATE_REQUIRED); }
     // Older CLI versions can send unrecognized slash commands as model prompts.
@@ -56,7 +59,7 @@ fn run(executable: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Reading {
     pub at: i64,
     quotas: Vec<Value>,

@@ -101,6 +101,7 @@ function NativeSetup({ agent, payload, settings, saving, onConnect }: {
   return <section className="scan-setup body-reveal" aria-label={providerNames[agent.id]}>
     <h3>{t('Recommended connection')}</h3>
     <p>{t(nativeConnectionDescription(agent))}</p>
+    {agent.sourcePath && <p><span>{t('Executable path')}: </span><code className="path-note">{agent.sourcePath}</code></p>}
     {enabled && <p>{t('This provider is enabled in your preferences.')}</p>}
     <Button disabled={!settings || saving} onClick={() => onConnect(payload)}>{t('Connect provider')}</Button>
   </section>

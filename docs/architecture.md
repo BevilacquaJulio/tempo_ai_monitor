@@ -9,7 +9,7 @@ O TempoAI é um aplicativo desktop **local-first** para Windows 11 construído c
 | **Interface (Frontend)** | `src/` | Renderização das telas (`overview`, `activity`, `settings`, `quick-monitor`), formatação de datas/cotas, tabela de referência de custo equivalente de API, gráficos, mapa de calor, Share Studio e ponte tipada com o Tauri (`src/services/desktop.ts`). |
 | **Núcleo desktop (Rust)** | `src-tauri/src/core/` | Agendamento e cache de atualizações (`monitor.rs`), preferências atômicas com patches parciais de UI (`preferences.rs`), histórico SQLite com migrações e retenção de 92 dias (`history.rs`), bandeja do sistema e janela flutuante (`desktop.rs`), e alertas nativos do Windows (`alerts.rs`). |
 | **Provedores (Rust)** | `src-tauri/src/providers/` | Contrato compartilhado de cotas/observações (`mod.rs`), leitura OAuth somente-leitura do Claude (`claude.rs`), cliente stdio RPC do Codex App Server (`codex.rs`), leitor CLI do Antigravity (`antigravity.rs`), parser streaming incremental de arquivos `.jsonl` (`jsonl.rs`) e varredura/fontes JSON locais (`discovery.rs`). |
-| **Persistência local** | `src-tauri/migrations/` | Esquema SQLite versionado via `PRAGMA user_version` para sessões agregadas, deduplicação de alertas por ciclo e último snapshot do Antigravity. |
+| **Persistência local** | `src-tauri/migrations/` | Esquema SQLite versionado via `PRAGMA user_version` para sessões agregadas, deduplicação de alertas por ciclo e últimas leituras salvas de Claude Code e Antigravity. |
 
 ## Fluxo de dados e desempenho
 
