@@ -399,13 +399,30 @@ pub fn resolve_local_dir(path: &Path) -> Option<PathBuf> {
     resolved.is_dir().then_some(resolved)
 }
 
+fn path_within_root(lower_path: &str, candidate: &Path) -> bool {
+    let matches_root = |root: &Path| {
+        let root_norm = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        let root_trimmed = root_norm.trim_end_matches('\\');
+        !root_trimmed.is_empty() && (lower_path == root_trimmed || lower_path.starts_with(&format!("{root_trimmed}\\")))
+    };
+    if matches_root(candidate) {
+        return true;
+    }
+    // Windows TEMP/TMP often contain 8.3 short names (e.g. RUNNER~1) while canonicalize returns long names.
+    fs::canonicalize(candidate)
+        .ok()
+        .and_then(|canonical| strip_windows_verbatim(&canonical))
+        .is_some_and(|resolved| matches_root(&resolved))
+}
+
 fn is_disallowed_shared_dir(path: &Path) -> bool {
     let lower = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    if path_within_root(&lower, &std::env::temp_dir()) {
+        return true;
+    }
     for var in ["TEMP", "TMP", "PUBLIC"] {
         if let Some(root) = std::env::var_os(var) {
-            let root_norm = PathBuf::from(root).to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-            let root_trimmed = root_norm.trim_end_matches('\\');
-            if !root_trimmed.is_empty() && (lower == root_trimmed || lower.starts_with(&format!("{root_trimmed}\\"))) {
+            if path_within_root(&lower, &PathBuf::from(root)) {
                 return true;
             }
         }
@@ -873,6 +890,40 @@ pub fn set_pin(app: AppHandle, window: WebviewWindow, state: State<'_, DesktopSt
     Ok(())
 }
 
+/// Creates a temporary directory in the workspace whose ACL is private to the current user even on shared CI drives (e.g. D:\a\...).
+#[cfg(test)]
+pub(crate) fn trusted_test_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    #[cfg(windows)]
+    if is_writable_by_other_users(dir.path()) {
+        restrict_dir_to_current_user(dir.path());
+    }
+    dir
+}
+
+#[cfg(all(test, windows))]
+fn restrict_dir_to_current_user(path: &Path) {
+    let whoami = std::process::Command::new("whoami").args(["/user"]).output().expect("whoami /user");
+    assert!(whoami.status.success(), "whoami /user failed");
+    let stdout = String::from_utf8_lossy(&whoami.stdout);
+    let sid = stdout
+        .split_whitespace()
+        .find(|token| token.starts_with("S-1-"))
+        .expect("current user SID from whoami /user");
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            &format!("*{sid}:(OI)(CI)F"),
+        ])
+        .output()
+        .expect("icacls");
+    assert!(output.status.success(), "icacls failed to restrict test directory");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,7 +1054,7 @@ mod tests {
 
     #[test]
     fn zero_config_connections_pin_and_clear_trusted_executables() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = trusted_test_dir();
         let codex_exe = dir.path().join("codex.exe");
         let agy_exe = dir.path().join("agy.exe");
         fs::write(&codex_exe, "synthetic").unwrap();
@@ -1080,5 +1131,11 @@ mod tests {
         let _ = fs::write(&temp_file, "test");
         assert!(is_trusted_executable_path(&temp_file).is_none());
         let _ = fs::remove_file(&temp_file);
+
+        let private_dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        restrict_dir_to_current_user(private_dir.path());
+        let private_exe = private_dir.path().join("tool.exe");
+        fs::write(&private_exe, "test").unwrap();
+        assert!(is_trusted_executable_path(&private_exe).is_some());
     }
 }

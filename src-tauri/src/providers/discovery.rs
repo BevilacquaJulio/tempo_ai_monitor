@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn detects_known_files_without_launching_and_distinguishes_a_shim_from_native_codex() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = crate::core::preferences::trusted_test_dir();
         let root = dir.path();
         for name in ["agy.exe", "codex.cmd", "not-an-agent.exe"] {
             fs::write(root.join(name), "this is not executable").unwrap();

@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn pinned_executable_rejects_moved_or_changed_cli_targets() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = crate::core::preferences::trusted_test_dir();
         let exe_a = dir.path().join("codex.exe");
         let exe_b_dir = dir.path().join("other");
         std::fs::create_dir(&exe_b_dir).unwrap();
