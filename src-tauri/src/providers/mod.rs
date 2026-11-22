@@ -96,6 +96,58 @@ pub(crate) fn session(
     })))
 }
 
+/// Windows Job Object guard configured with `KILL_ON_JOB_CLOSE` so child and grandchild
+/// processes cannot outlive a completed or timed-out CLI check.
+#[cfg(windows)]
+pub(crate) struct ProcessJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl ProcessJob {
+    pub(crate) fn attach(child: &std::process::Child) -> Option<Self> {
+        use std::{ffi::c_void, mem::size_of, os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+        unsafe {
+            let job = CreateJobObjectW(ptr::null(), ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if configured == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +157,24 @@ mod tests {
         assert_eq!(observed_quota("claude", "weekly", "", &json!(80), &json!(9000), 100, 401)["status"], "stale");
         assert_eq!(observed_quota("claude", "weekly", "", &json!(80), &json!(400), 399, 401)["status"], "stale");
         assert_eq!(observed_quota("claude", "weekly", "", &Value::Null, &json!(9000), 400, 401)["usedPercent"], Value::Null);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn process_job_terminates_attached_process_on_drop() {
+        use std::{os::windows::process::CommandExt, process::{Command, Stdio}, time::Instant};
+        let mut command = Command::new("ping");
+        command
+            .args(["127.0.0.1", "-n", "15"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000);
+        let mut child = command.spawn().expect("spawn ping");
+        let job = ProcessJob::attach(&child).expect("attach Job Object");
+        let started = Instant::now();
+        drop(job);
+        let _ = child.wait();
+        assert!(started.elapsed().as_secs() < 5, "job close should terminate attached process immediately");
     }
 }

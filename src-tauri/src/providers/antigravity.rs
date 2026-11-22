@@ -4,17 +4,54 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::{collections::HashSet, io::Read, path::Path, process::{Command, Stdio}, sync::mpsc, time::{Duration, Instant}};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{mpsc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
+};
 
 pub const ID: &str = "antigravity";
 const UPDATE_REQUIRED: &str = "Update Antigravity CLI to version 1.1.11 or newer to check usage here.";
 const COULD_NOT_READ: &str = "Could not check Antigravity usage. Check your Google sign-in in Antigravity and try again.";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutableStamp {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+}
+
+fn executable_stamp(path: &Path) -> Option<ExecutableStamp> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    (meta.file_type().is_file() && !meta.file_type().is_symlink())
+        .then(|| meta.modified().ok().map(|modified| ExecutableStamp { path: path.to_path_buf(), modified, len: meta.len() }))
+        .flatten()
+}
+
+/// Caches the `--version` check per binary stamp so routine polls only spawn `agy.exe` once instead of twice.
+fn verify_supported_version(executable: &Path) -> Result<(), &'static str> {
+    static VERIFIED: OnceLock<Mutex<Option<ExecutableStamp>>> = OnceLock::new();
+    let cache = VERIFIED.get_or_init(Mutex::default);
+    let stamp = executable_stamp(executable);
+    if stamp.is_some() && *cache.lock().unwrap_or_else(|error| error.into_inner()) == stamp {
+        return Ok(());
+    }
+    let version = run(executable, &["--version"], Duration::from_secs(5)).ok_or(UPDATE_REQUIRED)?;
+    if !supports_usage(&String::from_utf8_lossy(&version)) {
+        return Err(UPDATE_REQUIRED);
+    }
+    *cache.lock().unwrap_or_else(|error| error.into_inner()) = stamp;
+    Ok(())
+}
+
 pub fn read(executable: &Path) -> Result<Reading, &'static str> {
     let executable = is_trusted_executable_path(executable).ok_or("Could not find a trusted local Antigravity CLI executable.")?;
-    let version = run(&executable, &["--version"], Duration::from_secs(5)).ok_or(UPDATE_REQUIRED)?;
-    if !supports_usage(&String::from_utf8_lossy(&version)) { return Err(UPDATE_REQUIRED); }
     // Older CLI versions can send unrecognized slash commands as model prompts.
+    verify_supported_version(&executable)?;
     let output = run(&executable, &["-p", "/usage", "--output-format", "json"], Duration::from_secs(20)).ok_or(COULD_NOT_READ)?;
     let result = serde_json::from_slice(&output).map_err(|_| COULD_NOT_READ)?;
     parse_usage(&result, Utc::now().timestamp()).ok_or(COULD_NOT_READ)
@@ -36,6 +73,8 @@ fn run(executable: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x08000000);
     let mut child = command.spawn().ok()?;
+    #[cfg(windows)]
+    let _job = providers::ProcessJob::attach(&child);
     let stdout = child.stdout.take().expect("piped stdout");
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
@@ -106,6 +145,17 @@ mod tests {
     fn read_only_command_requires_a_supported_release() {
         for version in ["1.1.10", "1.1.11-rc.1", "1.5", "", "agy"] { assert!(!supports_usage(version)); }
         for version in ["1.1.11", "v1.5.8\r\n", "2.0.0"] { assert!(supports_usage(version)); }
+    }
+
+    #[test]
+    fn executable_stamp_detects_binary_updates() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let binary = dir.path().join("agy.exe");
+        fs::write(&binary, "v1").unwrap();
+        let first = executable_stamp(&binary).unwrap();
+        fs::write(&binary, "v1.12.0-updated").unwrap();
+        let second = executable_stamp(&binary).unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]

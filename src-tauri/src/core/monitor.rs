@@ -50,7 +50,20 @@ impl ProviderCache {
 struct Cache {
     claude: ProviderCache,
     codex: ProviderCache,
+    codex_rpc_at: Option<Instant>,
     last_attempt: Option<Instant>,
+}
+
+const CODEX_RPC_CADENCE_SECS: u64 = 120;
+
+fn should_query_codex_rpc(cache: &ProviderCache, last_rpc: Option<Instant>, kind: Refresh, now: i64) -> bool {
+    if matches!(kind, Refresh::Forced) {
+        return true;
+    }
+    if cache.sample.is_none() || cache.error.is_some() || cache.stale(now) {
+        return true;
+    }
+    last_rpc.is_none_or(|at| at.elapsed() >= Duration::from_secs(CODEX_RPC_CADENCE_SECS))
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +150,7 @@ pub struct Monitor {
     cache: Mutex<Cache>,
     running: AtomicBool,
     pending: AtomicBool,
+    forced: AtomicBool,
     path: PathBuf,
     claude_logs: Mutex<jsonl::ClaudeLogCache>,
     codex_logs: Mutex<jsonl::CodexLogCache>,
@@ -182,6 +196,7 @@ impl Monitor {
             cache: Mutex::new(cache),
             running: AtomicBool::new(false),
             pending: AtomicBool::new(false),
+            forced: AtomicBool::new(false),
             path,
             claude_logs: Mutex::default(),
             codex_logs: Mutex::default(),
@@ -219,7 +234,10 @@ impl Monitor {
                 self.claude_poll_reset.store(true, Ordering::Release);
                 self.claude_watch_fast.store(false, Ordering::Release);
             }
-            if codex_changed { cache.codex.reset(); }
+            if codex_changed {
+                cache.codex.reset();
+                cache.codex_rpc_at = None;
+            }
             cache.last_attempt = None;
         }
         if claude_changed && !next.claude_enabled {
@@ -393,6 +411,7 @@ fn queue_with_mode(app: &AppHandle, immediate: bool, manual: bool) {
     let agy_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || { let _ = check_antigravity(&agy_app, manual); });
     let state = app.state::<Monitor>();
+    if manual { state.forced.store(true, Ordering::Release); }
     if immediate { state.pending.store(true, Ordering::Release); }
     if state.running.swap(true, Ordering::AcqRel) { return; }
     let app = app.clone();
@@ -400,10 +419,21 @@ fn queue_with_mode(app: &AppHandle, immediate: bool, manual: bool) {
         let state = app.state::<Monitor>();
         {
             let _running = Running(&state.running);
-            let kind = if state.pending.swap(false, Ordering::AcqRel) { Refresh::Requested } else { Refresh::Periodic };
+            let kind = if state.forced.swap(false, Ordering::AcqRel) {
+                state.pending.store(false, Ordering::Release);
+                Refresh::Forced
+            } else if state.pending.swap(false, Ordering::AcqRel) {
+                Refresh::Requested
+            } else {
+                Refresh::Periodic
+            };
             refresh(&app, &state, kind);
         }
-        if state.pending.load(Ordering::Acquire) { queue(&app, false); }
+        if state.forced.load(Ordering::Acquire) {
+            queue_with_mode(&app, true, true);
+        } else if state.pending.load(Ordering::Acquire) {
+            queue(&app, false);
+        }
     });
 }
 
@@ -461,12 +491,13 @@ fn refresh(app: &AppHandle, state: &Monitor, kind: Refresh) -> Vec<IntegrationCh
     let now = Utc::now().timestamp();
     state.maybe_prune_expired(now);
     let desktop = app.state::<DesktopState>();
-    let (settings, claude_revision, codex_revision) = {
+    let (settings, claude_revision, codex_revision, query_codex_rpc) = {
         let settings = desktop.config.lock().unwrap_or_else(|error| error.into_inner());
         let mut cache = state.cache.lock().unwrap_or_else(|error| error.into_inner());
         if !kind.can_start(cache.last_attempt) { return Vec::new(); }
         if settings.claude_enabled || settings.codex_enabled { cache.last_attempt = Some(Instant::now()); }
-        (settings.clone(), cache.claude.revision, cache.codex.revision)
+        let query_rpc = settings.codex_enabled && should_query_codex_rpc(&cache.codex, cache.codex_rpc_at, kind, now);
+        (settings.clone(), cache.claude.revision, cache.codex.revision, query_rpc)
     };
     let clear_cutoff = if settings.claude_enabled || settings.codex_enabled {
         let _write = state.history_write.lock().unwrap_or_else(|error| error.into_inner());
@@ -481,21 +512,42 @@ fn refresh(app: &AppHandle, state: &Monitor, kind: Refresh) -> Vec<IntegrationCh
             .map(|dir| jsonl::read_claude_sessions(&dir, now, clear_cutoff, &mut state.claude_logs.lock().unwrap_or_else(|error| error.into_inner())))
             .unwrap_or_default()
     });
-    let codex_data = settings.codex_enabled.then(|| {
+    let mut ran_codex_rpc = false;
+    let (codex_collection, codex_log_only_sessions) = if settings.codex_enabled {
         let logs = jsonl::codex_sessions_dir()
             .map(|dir| jsonl::read_codex_sessions(&dir, now, clear_cutoff, &mut state.codex_logs.lock().unwrap_or_else(|error| error.into_inner())))
             .unwrap_or(jsonl::CodexLogResult { sessions: Vec::new(), latest_observation: None });
-        match resolve_pinned_executable(settings.codex_executable.as_deref(), discovery::codex_executable(), CODEX_MOVED) {
-            Ok(Some(exe)) => merge_codex(Some(codex::read(&exe, now)), logs, now),
-            Ok(None) => merge_codex(None, logs, now),
-            Err(moved_error) => Collection { sample: Err(moved_error), sessions: logs.sessions },
+        if query_codex_rpc {
+            let collection = match resolve_pinned_executable(settings.codex_executable.as_deref(), discovery::codex_executable(), CODEX_MOVED) {
+                Ok(Some(exe)) => {
+                    ran_codex_rpc = true;
+                    merge_codex(Some(codex::read(&exe, now)), logs, now)
+                }
+                Ok(None) => merge_codex(None, logs, now),
+                Err(moved_error) => Collection { sample: Err(moved_error), sessions: logs.sessions },
+            };
+            (Some(collection), None)
+        } else {
+            // Focus/panel refreshes keep local JSONL history fresh without respawning codex.exe while the sample is fresh.
+            (None, Some(logs.sessions))
         }
-    });
+    } else {
+        (None, None)
+    };
     let (checks, history_rows, current) = {
         let current = desktop.config.lock().unwrap_or_else(|error| error.into_inner());
         let mut cache = state.cache.lock().unwrap_or_else(|error| error.into_inner());
         let claude_rows = claude_sessions.filter(|_| cache.claude.revision == claude_revision).map(|sessions| (sessions, None));
-        let (codex_check, codex_rows) = record_check(&mut cache.codex, "codex", codex_revision, codex_data, now);
+        let (codex_check, codex_rows) = if let Some(sessions) = codex_log_only_sessions {
+            let rows = (cache.codex.revision == codex_revision).then_some((sessions, None));
+            let check = IntegrationCheck { provider_id: "codex".into(), status: "connected", message: "Connected." };
+            (check, rows)
+        } else {
+            if ran_codex_rpc && cache.codex.revision == codex_revision {
+                cache.codex_rpc_at = Some(Instant::now());
+            }
+            record_check(&mut cache.codex, "codex", codex_revision, codex_collection, now)
+        };
         (
             vec![codex_check],
             [("claude", "Claude Code", false, claude_rows), ("codex", "OpenAI Codex", current.codex_alerts, codex_rows)],
@@ -1242,6 +1294,25 @@ mod tests {
         let merged = merge_codex(None, logs, 1000);
         assert_eq!(merged.sample.unwrap().at, 990);
         assert_eq!(merged.sessions.len(), 1);
+    }
+
+    #[test]
+    fn codex_rpc_skips_redundant_spawns_on_focus_while_sample_is_fresh() {
+        let mut cache = ProviderCache::default();
+        assert!(should_query_codex_rpc(&cache, None, Refresh::Requested, 1000));
+
+        cache.record(Ok(sample(1000)));
+        let recent = Some(Instant::now());
+        assert!(!should_query_codex_rpc(&cache, recent, Refresh::Requested, 1030));
+        assert!(should_query_codex_rpc(&cache, recent, Refresh::Forced, 1030));
+        assert!(should_query_codex_rpc(&cache, recent, Refresh::Requested, 1301));
+
+        if let Some(old_rpc) = Instant::now().checked_sub(Duration::from_secs(CODEX_RPC_CADENCE_SECS + 1)) {
+            assert!(should_query_codex_rpc(&cache, Some(old_rpc), Refresh::Requested, 1030));
+        }
+
+        cache.record(Err("Codex unavailable."));
+        assert!(should_query_codex_rpc(&cache, recent, Refresh::Requested, 1030));
     }
 
     #[test]

@@ -13,6 +13,8 @@ use std::{
 
 struct Rpc {
     child: Child,
+    #[cfg(windows)]
+    _job: Option<providers::ProcessJob>,
     messages: mpsc::Receiver<Value>,
     deadline: Instant,
 }
@@ -25,6 +27,8 @@ impl Rpc {
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, 0x08000000);
         let mut child = command.spawn().map_err(|_| "Could not start the Codex executable.")?;
+        #[cfg(windows)]
+        let _job = providers::ProcessJob::attach(&child);
         let output = child.stdout.take().expect("piped stdout");
         let (tx, messages) = mpsc::sync_channel(16);
         std::thread::spawn(move || {
@@ -40,7 +44,13 @@ impl Rpc {
                 }
             }
         });
-        Ok(Self { child, messages, deadline: Instant::now() + Duration::from_secs(20) })
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            _job,
+            messages,
+            deadline: Instant::now() + Duration::from_secs(20),
+        })
     }
 
     fn send(&mut self, request: Value) -> Result<(), ()> {
